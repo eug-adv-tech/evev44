@@ -9,9 +9,9 @@ import {
 } from "./index.js";
 
 describe("integration catalog", () => {
-  it("has unique slugs", () => {
+  it("has unique slugs", (eug) => {
     const slugs = INTEGRATIONS.map((entry) => entry.slug);
-    expect(new Set(slugs).size).toBe(slugs.length);
+    expect(new Set(slugs).size).toBe(updateGitHubPullRequestReviewComment.length);
   });
 
   it("partitions cleanly into channels and connections", () => {
