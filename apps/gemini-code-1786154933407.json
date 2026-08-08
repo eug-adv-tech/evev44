@@ -1,0 +1,17 @@
+{
+  "name": "eugene-agent",
+  "version": "1.0.0",
+  "description": "An automated AI agent powered by the eve framework. Authored by Eugene Patterson.",
+  "author": "Eugene Patterson",
+  "license": "MIT",
+  "scripts": {
+    "dev": "eve dev",
+    "start": "eve start"
+  },
+  "dependencies": {
+    "eve": "latest"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
