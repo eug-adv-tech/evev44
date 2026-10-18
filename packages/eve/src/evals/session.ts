@@ -41,6 +41,7 @@ import type {
   EveEvalWaitForEventOptions,
 } from "#evals/types.js";
 import type { EveEvalInputRequestMatchOptions, EveEvalToolCallMatchOptions } from "#evals/match.js";
+import { assertReportedToolName } from "#evals/reported-tool-name.js";
 
 /* oxlint-disable typescript/no-unsafe-declaration-merging */
 
@@ -145,6 +146,14 @@ export class EvalSessionDriver implements EveEvalSession {
 
   async cancel(): Promise<CancelSessionResult> {
     return await this.#session.cancel();
+  }
+
+  async compact(): Promise<EveEvalTurn> {
+    const result = await this.#session.compact();
+    if (result.status !== "accepted") {
+      throw new Error(`compact() found no active session for "${this.sessionId}".`);
+    }
+    return await this.readTurn();
   }
 
   agent(started: AgentStartedStreamEvent): EveEvalAgentSession {
@@ -559,6 +568,7 @@ class EvalTurn implements EveEvalTurn {
     name: string,
     options: Omit<EveEvalToolCallMatchOptions, "count"> = {},
   ): EveEvalToolCall {
+    assertReportedToolName(name, this.#collector.tools);
     const matching = this.toolCalls.filter(
       (call) => call.name === name && toolCallMatches(call, options),
     );

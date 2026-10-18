@@ -115,11 +115,38 @@ describe("normalizeToolDefinition", () => {
     expect(entry).toEqual({ kind: "disabled" });
   });
 
-  it("returns a configured entry for the provider-managed web search tool", () => {
-    expect(normalizeToolDefinition(webSearch({ provider: "exa" }), FAILURE_MESSAGE)).toEqual({
-      kind: "web-search-tool",
-      provider: "exa",
-    });
+  it.each(["exa", "parallel", "browserbase", "native"] as const)(
+    "normalizes the %s web search provider",
+    (provider) => {
+      expect(normalizeToolDefinition(webSearch({ provider }), FAILURE_MESSAGE)).toEqual({
+        kind: "web-search-tool",
+        selection: { provider },
+      });
+    },
+  );
+
+  it("normalizes a web search fallback provider", () => {
+    expect(
+      normalizeToolDefinition(webSearch({ fallback: "exa", provider: "native" }), FAILURE_MESSAGE),
+    ).toEqual({ kind: "web-search-tool", selection: { fallback: "exa", provider: "native" } });
+  });
+
+  it("rejects a fallback that can't serve every Gateway model", () => {
+    expect(() =>
+      normalizeToolDefinition(
+        { fallback: "native", kind: "eve:web-search-tool", provider: "native" },
+        FAILURE_MESSAGE,
+      ),
+    ).toThrow('Expected "fallback" to be one of: exa, parallel, browserbase');
+  });
+
+  it("rejects a fallback for a provider that serves every Gateway model", () => {
+    expect(() =>
+      normalizeToolDefinition(
+        { fallback: "parallel", kind: "eve:web-search-tool", provider: "exa" },
+        FAILURE_MESSAGE,
+      ),
+    ).toThrow('"fallback" applies only to provider "native"');
   });
 
   it("rejects an unsupported web search provider", () => {
@@ -258,6 +285,29 @@ describe("normalizeToolDefinition", () => {
     expect(normalizeToolDefinition(tool, FAILURE_MESSAGE).kind).toBe("tool");
   });
 
+  it("types custom approval prompts from the tool input schema", () => {
+    const tool = defineTool({
+      description: "Requests city-scoped approval.",
+      inputSchema: z.object({ city: z.string() }),
+      approval: {
+        request: once(),
+        prompt({ callId, input, toolName }) {
+          const city: string = input.city;
+          // @ts-expect-error approval prompt input is schema-typed, not an open record.
+          const missing = input.missing;
+          void callId;
+          void missing;
+          return `Run ${toolName} for ${city}?`;
+        },
+      },
+      execute(input) {
+        return input.city;
+      },
+    });
+
+    expect(normalizeToolDefinition(tool, FAILURE_MESSAGE).kind).toBe("tool");
+  });
+
   it("accepts explicit request and response approval policies", () => {
     const tool = defineTool({
       approval: {
@@ -299,6 +349,22 @@ describe("normalizeToolDefinition", () => {
         FAILURE_MESSAGE,
       ),
     ).toThrow('Unknown key "needsApproval"');
+  });
+
+  it("rejects authored tools whose approval prompt is not a function", () => {
+    expect(() =>
+      normalizeToolDefinition(
+        {
+          approval: { request: once(), prompt: "not a function" },
+          description: "Echo.",
+          execute(input: unknown) {
+            return input;
+          },
+          inputSchema: { type: "object" },
+        },
+        FAILURE_MESSAGE,
+      ),
+    ).toThrow(FAILURE_MESSAGE);
   });
 
   it("rejects authored tools whose `toModelOutput` is not a function", () => {

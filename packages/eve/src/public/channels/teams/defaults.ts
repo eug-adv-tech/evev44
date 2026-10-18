@@ -1,8 +1,18 @@
 import type { SessionAuthContext } from "#channel/types.js";
 
+import { resolvedPromptAnswer } from "#channel/resolved-prompt.js";
 import { extractErrorId, formatErrorHint } from "#internal/logging.js";
 import type { ConnectionAuthorizationOutcome } from "#protocol/message.js";
-import { splitTeamsMessageText, type TeamsMention } from "#public/channels/teams/api.js";
+import {
+  splitTeamsMessageText,
+  type TeamsChannelAccount,
+  type TeamsMention,
+} from "#public/channels/teams/api.js";
+import {
+  renderTeamsAuthorizationPrompt,
+  renderTeamsAuthorizationStatus,
+  teamsAuthorizationDisplayName,
+} from "#public/channels/teams/authorization.js";
 import {
   renderAnsweredInputRequestMessage,
   renderInputRequestMessage,
@@ -10,11 +20,11 @@ import {
 import type { TeamsInvokeActivity, TeamsMessageActivity } from "#public/channels/teams/inbound.js";
 import type {
   TeamsChannelEvents,
+  TeamsChannelState,
   TeamsContext,
   TeamsInboundResult,
 } from "#public/channels/teams/teamsChannel.js";
 import { displayProperName } from "#shared/display-name.js";
-import { parseJsonObject } from "#shared/json.js";
 
 /** Default auth projection for Teams message actors. */
 export function defaultTeamsAuth(
@@ -76,17 +86,20 @@ export const defaultEvents: TeamsChannelEvents = {
           replyToActivityId: channel.teams.replyToActivityId,
         }),
       );
-      if (request.kind === "tool-approval" && posted.id) {
-        channel.state.pendingApprovalCards = {
-          ...channel.state.pendingApprovalCards,
-          [request.requestId]: { activityId: posted.id, prompt: request.prompt },
-        };
-      }
+      if (!posted.id) continue;
+      const card = { activityId: posted.id, prompt: request.prompt };
+      channel.state.pendingPromptCards = {
+        ...channel.state.pendingPromptCards,
+        [request.requestId]:
+          request.kind === "question"
+            ? { ...card, options: (request.options ?? []).map(({ id, label }) => ({ id, label })) }
+            : card,
+      };
     }
   },
 
   async "approval.settled"(event, channel, _ctx) {
-    const cards = channel.state.pendingApprovalCards ?? {};
+    const cards = channel.state.pendingPromptCards ?? {};
     const card = cards[event.requestId];
     if (card === undefined) return;
     const account = channel.state.approvalResponderAccounts?.[event.responderPrincipalId];
@@ -102,7 +115,28 @@ export const defaultEvents: TeamsChannelEvents = {
     );
     const next = { ...cards };
     delete next[event.requestId];
-    channel.state.pendingApprovalCards = next;
+    channel.state.pendingPromptCards = next;
+  },
+
+  // `approval.settled` runs first and retires pressed approvals with their
+  // responder. Cards that end any other way (a typed answer, any question, or a
+  // withdrawal) are retired here.
+  async "input.resolved"(event, channel, _ctx) {
+    for (const resolution of event.resolutions) {
+      const cards = channel.state.pendingPromptCards ?? {};
+      const card = cards[resolution.requestId];
+      if (card === undefined) continue;
+      await channel.thread.update(
+        card.activityId,
+        renderAnsweredInputRequestMessage({
+          includeText: false,
+          label: resolvedPromptAnswer(resolution, card.options),
+          prompt: card.prompt,
+        }),
+      );
+      const { [resolution.requestId]: _, ...rest } = cards;
+      channel.state.pendingPromptCards = rest;
+    }
   },
 
   async "message.completed"(event, channel, _ctx) {
@@ -126,6 +160,7 @@ export const defaultEvents: TeamsChannelEvents = {
   },
 
   async "turn.failed"(event, channel, _ctx) {
+    if (event.terminal) return;
     const hint = formatErrorHint(event);
     const errorId = extractErrorId(event.details);
     await channel.thread.post(
@@ -139,48 +174,17 @@ export const defaultEvents: TeamsChannelEvents = {
   },
 
   async "authorization.required"(event, channel, _ctx) {
-    const displayName = event.authorization?.displayName ?? formatConnectionDisplayName(event.name);
-    const url = event.authorization?.url;
-    const text = url
-      ? `Authorization required for ${displayName}: ${url}`
-      : `Authorization required for ${displayName}.`;
-    const posted = await channel.thread.post({
-      attachments: [
-        {
-          content: parseJsonObject({
-            $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
-            actions: url
-              ? [
-                  {
-                    title: `Sign in with ${displayName}`,
-                    type: "Action.OpenUrl",
-                    url,
-                  },
-                ]
-              : [],
-            body: [
-              {
-                text: `Authorization required for ${displayName}`,
-                type: "TextBlock",
-                weight: "Bolder",
-                wrap: true,
-              },
-              {
-                text: channel.state.triggeringUser
-                  ? `Requested by ${channel.state.triggeringUser.name ?? channel.state.triggeringUser.id}.`
-                  : "No triggering user is available for a private prompt.",
-                type: "TextBlock",
-                wrap: true,
-              },
-            ],
-            type: "AdaptiveCard",
-            version: channel.adaptiveCardVersion,
-          }),
-          contentType: "application/vnd.microsoft.card.adaptive",
-        },
-      ],
-      text,
-    });
+    const user = signInAccount(event, channel.state);
+    const options = {
+      adaptiveCardVersion: channel.adaptiveCardVersion,
+      replyToActivityId: channel.teams.replyToActivityId,
+      requester: user ? (user.name ?? user.id) : undefined,
+    };
+    const posted = await channel.thread.post(
+      channel.state.conversationType === "personal"
+        ? renderTeamsAuthorizationPrompt(event, options)
+        : renderTeamsAuthorizationStatus(event, options),
+    );
     if (posted.id) {
       channel.state.pendingAuthActivityId = posted.id;
     }
@@ -193,9 +197,8 @@ export const defaultEvents: TeamsChannelEvents = {
 
     const activityId = channel.state.pendingAuthActivityId;
     if (!activityId) return;
-    const displayName = event.authorization?.displayName ?? formatConnectionDisplayName(event.name);
     const text = buildAuthCompletedText({
-      displayName,
+      displayName: teamsAuthorizationDisplayName(event),
       outcome: event.outcome as ConnectionAuthorizationOutcome,
       reason: event.reason,
     });
@@ -203,6 +206,23 @@ export const defaultEvents: TeamsChannelEvents = {
     channel.state.pendingAuthActivityId = null;
   },
 };
+
+/**
+ * The Teams account that must sign in. An approver's sign-in names the
+ * approver, recorded when they pressed the approval, not whoever sent the
+ * turn's message.
+ */
+function signInAccount(
+  event: { readonly candidateId?: string; readonly principalId?: string },
+  state: TeamsChannelState,
+): TeamsChannelAccount | null {
+  const responder =
+    event.principalId === undefined
+      ? undefined
+      : state.approvalResponderAccounts?.[event.principalId];
+  if (responder !== undefined) return responder;
+  return event.candidateId === undefined ? state.triggeringUser : null;
+}
 
 /** A connection name for the Teams auth card (`linear` → `Linear`). */
 export function formatConnectionDisplayName(connectionName: string): string {

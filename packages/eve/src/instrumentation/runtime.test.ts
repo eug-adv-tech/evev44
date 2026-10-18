@@ -26,9 +26,9 @@ import {
   type InstrumentationRuntime,
   type InstrumentationStepScope,
 } from "#instrumentation/runtime.js";
-import { AgentSpanIdGenerator } from "#tracing/agent-span-id-generator.js";
-import { ContextAgentTraceStateStore } from "#tracing/agent-trace-context-store.js";
-import type { TraceCapturePolicy } from "#tracing/otel-declaration.js";
+import { AgentSpanIdGenerator } from "#compiled/@vercel/agent-runs/index.js";
+import { ContextAgentTraceStateStore } from "#tracing/eve/agent-trace-context-store.js";
+import type { TraceCapturePolicy } from "#tracing/eve/otel-declaration.js";
 import { readForwardedAudienceBaggage, writeForwardedAudienceBaggage } from "#protocol/baggage.js";
 import { ConversationContextKey } from "#shared/conversation-context.js";
 import { captureLogRecords } from "#internal/testing/log-records.js";
@@ -45,6 +45,7 @@ function createRuntime(
 ): InstrumentationRuntime {
   return {
     forceFlush: async () => undefined,
+    idGenerator: new AgentSpanIdGenerator(),
     hooks,
     otelSettings: {
       recordInputs: true,
@@ -215,6 +216,7 @@ describe("initializeSessionInstrumentation", () => {
       action: "record",
       recordInputs: true,
       recordOutputs: false,
+      explicitContentAudience: "private",
     });
     await expect(
       readTelemetry(
@@ -271,7 +273,6 @@ describe("initializeSessionInstrumentation", () => {
         },
         async (scope) =>
           scope.resolveRuntimeContext({
-            eveVersion: "0.0.0",
             emissionState: { sessionStarted: true, sequence: 0, stepIndex: 0, turnId: "turn-1" },
             environment: "test",
             modelInput: {
@@ -355,6 +356,7 @@ describe("initializeSessionInstrumentation", () => {
   });
 
   it("does not widen an unsampled parent with a record decision", () => {
+    registerInstrumentationRuntime(createRuntime({ capturesContent: true, publish: vi.fn() }));
     const ctx = createContext("public");
     ctx.set(ParentTraceContextKey, {
       decision: { action: "record", recordInputs: true, recordOutputs: true },
@@ -807,7 +809,6 @@ describe("bindInstrumentationRuntime", () => {
     };
     const readScopedState = (scope: InstrumentationStepScope<{ sessionId: string }>) => ({
       messageCount: scope.resolveRuntimeContext({
-        eveVersion: "0.0.0",
         emissionState: { sessionStarted: true, sequence: 0, stepIndex: 0, turnId: "turn-1" },
         environment: "test",
         modelInput: { instructions: undefined, messages: [{ content: "secret", role: "user" }] },
@@ -1001,7 +1002,7 @@ describe("bindSessionInstrumentation", () => {
     );
     const ctx = createContext();
     contextStorage.run(ctx, () => {
-      new ContextAgentTraceStateStore().setSession("session-1", {
+      new ContextAgentTraceStateStore().set("session", "session-1", {
         context: { spanId: "1".repeat(16), traceFlags: 1, traceId: "2".repeat(32) },
         decision: { action: "record", recordInputs: false, recordOutputs: true },
         rootSessionId: "session-1",

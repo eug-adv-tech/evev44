@@ -3,8 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DurableSession } from "#execution/durable-session-store.js";
 import type { SessionInbox } from "#execution/session-inbox/inbox.js";
 import { SessionStateCursor } from "#execution/session/state-cursor.js";
+import { applyRunMessagesStep } from "#execution/tools/workflow/apply-run-messages-step.js";
 import { answerTaskCancel } from "#execution/tasks/session.js";
-import { applyTaskRunMessageStep } from "#execution/tasks/steps.js";
 import {
   createTask,
   markTaskRunStarted,
@@ -13,10 +13,10 @@ import {
   writeTaskTable,
   type TaskTable,
 } from "#execution/tasks/table.js";
-import {
-  getProxyInputRequests,
-  upsertProxyInputRequestState,
-} from "#harness/proxy-input-requests.js";
+
+import type { HarnessSession } from "#harness/types.js";
+import { withPublished, withRelays } from "#internal/testing/session-machine.js";
+import { createInputRequestedEvent } from "#protocol/message.js";
 import { createTestSessionState } from "#internal/testing/session-state.js";
 
 // No workflow runtime runs here: the run's cancel hook is a stub, and the
@@ -24,20 +24,36 @@ import { createTestSessionState } from "#internal/testing/session-state.js";
 // reach the session's own instrumentation.
 vi.mock("#internal/workflow/runtime.js", () => ({ resumeHook: vi.fn(async () => {}) }));
 const { published } = vi.hoisted(() => ({ published: [] as unknown[] }));
-vi.mock("#execution/publish-session-events.js", () => {
-  const publisher =
-    (origin: "own" | "relayed") =>
-    async (
+vi.mock("#execution/publish-session-events.js", async () => {
+  const { readDurableSession } = await import("#execution/durable-session-store.js");
+  const { sessionView } = await import("#harness/session-machine/commit.js");
+  const { storedProjection } = await import("#harness/session-machine/view.js");
+  return {
+    commitSessionStep: async (
+      target: {
+        readonly serializedContext: Record<string, unknown>;
+        readonly sessionState: Parameters<typeof readDurableSession>[0];
+      },
+      decide: (view: ReturnType<typeof sessionView>) => readonly { readonly events: unknown[] }[],
+      options: { readonly origin: "own" | "relayed" },
+    ) => {
+      const { state } = readDurableSession(target.sessionState);
+      for (const transition of decide(sessionView(storedProjection(state), state))) {
+        published.push(...transition.events.map((event) => ({ event, origin: options.origin })));
+      }
+      return { serializedContext: target.serializedContext, sessionState: target.sessionState };
+    },
+    publishSessionEvents: async (
       target: {
         readonly serializedContext: Record<string, unknown>;
         readonly sessionState: unknown;
       },
       events: readonly unknown[],
     ) => {
-      published.push(...events.map((event) => ({ event, origin })));
+      published.push(...events.map((event) => ({ event, origin: "own" })));
       return { serializedContext: target.serializedContext, sessionState: target.sessionState };
-    };
-  return { publishSessionEvents: publisher("own"), relaySessionEvents: publisher("relayed") };
+    },
+  };
 });
 
 const REQUEST_EVENT = { sequence: 3, stepIndex: 1, turnId: "turn_1" };
@@ -60,12 +76,11 @@ describe("answerTaskCancel", () => {
 
     await answerTaskCancel(cursor, {
       callId: "cancel-call",
-      kind: "task_cancel",
+      kind: "eve__task_cancel",
       taskId: research.taskId,
     });
 
-    const committed = cursor.sessionState.snapshot.session;
-    expect([...getProxyInputRequests(committed.state).keys()]).toEqual(["summarize-run-ask-1"]);
+    // Publishing drops the withdrawn question's route; here it only records what was published.
     expect(published).toEqual([
       {
         event: {
@@ -98,7 +113,49 @@ describe("answerTaskCancel", () => {
   });
 });
 
-describe("applyTaskRunMessageStep", () => {
+describe("applyRunMessagesStep", () => {
+  it("publishes a batch's reports and task results in the order they arrived", async () => {
+    const research = startedTask(readTaskTable(undefined), "research");
+    const summarize = startedTask(research.table, "summarize");
+    const cursor = cursorFor(
+      writeTaskTable(
+        createTestSessionState({ sessionId: "session-1" }).snapshot.session,
+        summarize.table,
+      ),
+    );
+    const from = (name: string, taskId: string) => ({
+      callId: `${name}-call`,
+      input: {},
+      runId: `${name}-run`,
+      sequence: 3,
+      stepIndex: 1,
+      taskId,
+      toolName: name,
+      turnId: "turn_1",
+    });
+
+    await cursor.advance((state) =>
+      applyRunMessagesStep({
+        ...state,
+        messages: [
+          { from: from("research", research.taskId), kind: "report", update: "sources found" },
+          {
+            from: from("research", research.taskId),
+            kind: "outcome",
+            result: { output: "Alice's brief", status: "completed" },
+          },
+          { from: from("summarize", summarize.taskId), kind: "report", update: "drafting" },
+        ],
+      }),
+    );
+
+    expect(published.map((entry) => (entry as { event: { type: string } }).event.type)).toEqual([
+      "action.partial",
+      "task.settled",
+      "action.partial",
+    ]);
+  });
+
   it("withdraws the questions of a task() run that fails on its own, and only those", async () => {
     const research = startedTask(readTaskTable(undefined), "research");
     const summarize = startedTask(research.table, "summarize");
@@ -111,27 +168,28 @@ describe("applyTaskRunMessageStep", () => {
     const cursor = cursorFor(session);
 
     await cursor.advance((state) =>
-      applyTaskRunMessageStep({
+      applyRunMessagesStep({
         ...state,
-        message: {
-          from: {
-            callId: "research-call",
-            input: {},
-            runId: "research-run",
-            sequence: 3,
-            stepIndex: 1,
-            taskId: research.taskId,
-            toolName: "research",
-            turnId: "turn_1",
+        messages: [
+          {
+            from: {
+              callId: "research-call",
+              input: {},
+              runId: "research-run",
+              sequence: 3,
+              stepIndex: 1,
+              taskId: research.taskId,
+              toolName: "research",
+              turnId: "turn_1",
+            },
+            kind: "outcome",
+            result: { error: "The research service is unavailable.", status: "failed" },
           },
-          kind: "outcome",
-          result: { error: "The research service is unavailable.", status: "failed" },
-        },
+        ],
       }),
     );
 
-    const committed = cursor.sessionState.snapshot.session;
-    expect([...getProxyInputRequests(committed.state).keys()]).toEqual(["summarize-run-ask-1"]);
+    // Publishing drops the withdrawn question's route; here it only records what was published.
     expect(published).toEqual([
       {
         event: {
@@ -200,23 +258,41 @@ function startedTask(
   };
 }
 
+/** A question the task's run asked, relayed as the session relays it. */
 function withQuestion(session: DurableSession, runId: string): DurableSession {
   const requestId = `${runId}-ask-1`;
-  const state = upsertProxyInputRequestState({
-    entries: [
-      [
-        requestId,
+  session = withPublished(session as HarnessSession, [
+    createInputRequestedEvent({
+      callId: `${runId.replace("-run", "")}-call`,
+      requests: [
         {
-          childContinuationToken: requestId,
-          event: REQUEST_EVENT,
+          action: { callId: requestId, input: {}, kind: "tool-call", toolName: "ask" },
           kind: "question",
-          runId,
-          workflowAsk: { control: `${runId}-control`, question: {} },
+          prompt: "Which region should Alice's report cover?",
+          requestId,
         },
       ],
-    ],
-    forChildContinuationToken: requestId,
-    state: session.state,
-  });
+      ...REQUEST_EVENT,
+    }),
+  ]);
+  const state = withRelays(
+    { state: session.state },
+    {
+      entries: [
+        [
+          requestId,
+          {
+            childContinuationToken: requestId,
+            event: REQUEST_EVENT,
+            kind: "question",
+            runId,
+            workflowAsk: { control: `${runId}-control` },
+            reply: {},
+          },
+        ],
+      ],
+      forChildContinuationToken: requestId,
+    },
+  ).state;
   return { ...session, state };
 }

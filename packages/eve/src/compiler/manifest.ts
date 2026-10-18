@@ -22,8 +22,10 @@ import type {
   SkillPackageSourceRef,
 } from "#shared/source-ref.js";
 import type { NamedSkillDefinition } from "#shared/skill-definition.js";
+import { WEB_SEARCH_FALLBACK_PROVIDERS, WEB_SEARCH_PROVIDERS } from "#shared/web-search.js";
 import {
   AGENT_WORKFLOW_RETENTION_VALUES,
+  ANTHROPIC_PROMPT_CACHE_TTLS,
   type InternalAgentDefinition,
   type InternalAgentModelDefinition,
   type InternalAgentCompactionDefinition,
@@ -196,6 +198,9 @@ export type CompiledSkillDefinition = NamedSkillDefinition &
  * Normalized authored schedule preserved in the compiled manifest.
  */
 export type CompiledScheduleDefinition = z.infer<typeof compiledScheduleDefinitionSchema>;
+export type CompiledScheduleCollectionDefinition = z.infer<
+  typeof compiledScheduleCollectionDefinitionSchema
+>;
 
 /**
  * Normalized authored sandbox metadata preserved in the compiled manifest.
@@ -573,6 +578,15 @@ const compiledRuntimeModelReferenceSchema: z.ZodType<CompiledRuntimeModelReferen
     id: z.string(),
     maxOutputTokens: z.number().int().positive().optional(),
     source: moduleSourceRefSchema.optional(),
+    promptCache: z
+      .object({
+        anthropic: z
+          .object({ ttl: z.literal(ANTHROPIC_PROMPT_CACHE_TTLS).optional() })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
     providerOptions: z.record(z.string(), jsonObjectSchema).optional(),
     routing: modelRoutingSchema,
   })
@@ -630,7 +644,7 @@ const compiledAgentConfigBaseFields = {
     .enum(["provider-default", "none", "minimal", "low", "medium", "high", "xhigh"])
     .optional(),
   source: moduleSourceRefSchema,
-  tool: z.boolean().optional(),
+  tool: z.union([z.boolean(), z.literal("deferred")]).optional(),
   limits: compiledAgentLimitsDefinitionSchema.optional(),
 };
 
@@ -678,6 +692,7 @@ const compiledInstructionsSchema: z.ZodType<CompiledInstructionsDefinition> = z.
 
 const compiledSkillBaseFields = {
   name: z.string(),
+  deferred: z.boolean().optional(),
   description: z.string(),
   license: z.string().optional(),
   markdown: z.string(),
@@ -744,6 +759,18 @@ const compiledScheduleDefinitionSchema = z.discriminatedUnion("sourceKind", [
     .strict(),
 ]);
 
+const compiledScheduleCollectionDefinitionSchema = z
+  .object({
+    description: z.string().optional(),
+    logicalPath: z.string(),
+    name: z.string(),
+    providerKind: z.string(),
+    sourceId: z.string(),
+    sourceKind: z.literal("module"),
+    tools: z.union([z.boolean(), z.literal("deferred")]).optional(),
+  })
+  .strict();
+
 const compiledSandboxDefinitionSchema = z
   .object({
     /** Stable provider name from the exported environment. */
@@ -777,6 +804,7 @@ const compiledWorkspaceResourceRootSchema = z
 
 const compiledConnectionDefinitionSchema = z
   .object({
+    experimental_events: z.literal(true).optional(),
     connectionName: z.string(),
     description: z.string(),
     exportName: z.string().optional(),
@@ -831,8 +859,9 @@ const compiledToolBehaviorSchema: z.ZodType<CompiledToolBehavior> = z
           .strict(),
         z
           .object({
+            fallback: z.enum(WEB_SEARCH_FALLBACK_PROVIDERS).optional(),
             kind: z.literal("provider-tool"),
-            provider: z.enum(["exa", "parallel"]),
+            provider: z.enum(WEB_SEARCH_PROVIDERS),
           })
           .strict(),
         z
@@ -844,7 +873,6 @@ const compiledToolBehaviorSchema: z.ZodType<CompiledToolBehavior> = z
           .strict(),
       ])
       .optional(),
-    presentation: z.literal("load-skill").optional(),
     shape: z
       .object({
         suspend: z.enum(["none", "workflow"]),
@@ -858,6 +886,7 @@ const compiledToolDefinitionSchema = z
   .object({
     availableInSubagents: z.boolean().optional(),
     behavior: compiledToolBehaviorSchema.optional(),
+    deferred: z.boolean().optional(),
     description: z.string(),
     exportName: z.string().optional(),
     hasExecute: z.boolean(),
@@ -982,6 +1011,7 @@ const compiledAgentResourceFields = {
   sandbox: compiledSandboxDefinitionSchema,
   sandboxWorkspaces: z.array(compiledSandboxWorkspaceSchema),
   schedules: z.array(compiledScheduleDefinitionSchema),
+  scheduleCollections: z.array(compiledScheduleCollectionDefinitionSchema).default([]),
   remoteAgents: z.array(compiledRemoteAgentNodeSchema),
   skills: z.array(compiledSkillSourceSchema).readonly(),
   instructions: z.array(compiledInstructionsSchema).readonly().default([]),
@@ -1090,6 +1120,7 @@ export const compiledAgentManifestSchema = z
     sandbox: compiledSandboxDefinitionSchema,
     sandboxWorkspaces: z.array(compiledSandboxWorkspaceSchema),
     schedules: z.array(compiledScheduleDefinitionSchema),
+    scheduleCollections: z.array(compiledScheduleCollectionDefinitionSchema).default([]),
     skills: z.array(compiledSkillSourceSchema).readonly(),
     subagents: z.array(compiledSubagentNodeSchema),
     instructions: z.array(compiledInstructionsSchema).readonly().default([]),
@@ -1118,6 +1149,7 @@ export interface CreateCompiledAgentResourcesInput {
   readonly sandbox: CompiledSandboxDefinition;
   readonly sandboxWorkspaces?: readonly CompiledSandboxWorkspace[];
   readonly schedules?: readonly CompiledScheduleDefinition[];
+  readonly scheduleCollections?: readonly CompiledScheduleCollectionDefinition[];
   readonly skills?: readonly CompiledSkillDefinition[];
   readonly instructions?: readonly CompiledInstructionsDefinition[];
   readonly tools?: readonly CompiledToolDefinition[];
@@ -1157,6 +1189,7 @@ export function createCompiledAgentResources(
     sandbox: input.sandbox,
     sandboxWorkspaces: [...(input.sandboxWorkspaces ?? [])],
     schedules: [...(input.schedules ?? [])],
+    scheduleCollections: [...(input.scheduleCollections ?? [])],
     skills: [...(input.skills ?? [])],
     tools: [...(input.tools ?? [])],
     workspaceResourceRoot: input.workspaceResourceRoot ?? {
@@ -1300,6 +1333,7 @@ export function createCompiledAgentManifest(input: {
   readonly sandbox: CompiledSandboxDefinition;
   readonly sandboxWorkspaces?: readonly CompiledSandboxWorkspace[];
   readonly schedules?: readonly CompiledScheduleDefinition[];
+  readonly scheduleCollections?: readonly CompiledScheduleCollectionDefinition[];
   readonly skills?: readonly CompiledSkillDefinition[];
   readonly subagents?: readonly CompiledSubagentNode[];
   readonly instructions?: readonly CompiledInstructionsDefinition[];
@@ -1333,6 +1367,9 @@ function cloneCompiledRuntimeModelReference(
   }
   if (model.providerOptions !== undefined) {
     clone.providerOptions = { ...model.providerOptions };
+  }
+  if (model.promptCache !== undefined) {
+    clone.promptCache = structuredClone(model.promptCache);
   }
   if (model.source !== undefined) {
     clone.source = { ...model.source };

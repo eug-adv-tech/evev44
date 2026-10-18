@@ -1,5 +1,8 @@
 import { SESSION_CHECKPOINT_VERSION, type SessionCheckpoint } from "#execution/session/handoff.js";
 import { isObject } from "#shared/guards.js";
+import { initialSessionProjection } from "#protocol/session-projection.js";
+import { getBlockingWorkflowToolRuns } from "#harness/workflow-tool-runs.js";
+import { LEGACY_HITL_STATE_KEYS, upgradeLegacyHitlState } from "#harness/hitl/requests.js";
 
 /**
  * Oldest checkpoint a successor upgrades (eve 0.66.0). Earlier checkpoints
@@ -87,6 +90,26 @@ const CHECKPOINT_UPGRADES: Readonly<
       sessionState: { ...sessionState, snapshot: { ...snapshot, session }, version: 2 },
     };
   },
+  // Lifecycle moved from emission/batch registries to the projection and TurnState.
+  11: upgradeIdleLifecycle,
+  // Version 13 prevents older deployments from ignoring stubs and running real tools.
+  // Existing checkpoints need no data changes.
+  12: (checkpoint) => checkpoint,
+  // Version 14 prevents older deployments from dropping the batched messages
+  // workflow tool runs relay. Existing checkpoints need no data changes.
+  13: (checkpoint) => checkpoint,
+  // Approval candidates, sign-ins and relayed requests moved under one requests key.
+  14: (checkpoint) => {
+    const sessionState = readRecord(checkpoint, "sessionState");
+    const snapshot = readRecord(sessionState, "snapshot");
+    const session = readRecord(snapshot, "session");
+    if (session.state === undefined) return checkpoint;
+    const state = upgradeLegacyHitlState(readRecord(session, "state"));
+    return {
+      ...checkpoint,
+      sessionState: { ...sessionState, snapshot: { ...snapshot, session: { ...session, state } } },
+    };
+  },
 };
 
 /**
@@ -125,6 +148,87 @@ export function migrateSessionCheckpoint(checkpoint: unknown): SessionCheckpoint
     return { kind: "incompatible", detail: `checkpoint version ${version} is incomplete` };
   }
   return { kind: "current", checkpoint: current, childRunIdsToStop: effects.childRunIdsToStop };
+}
+
+function upgradeIdleLifecycle(checkpoint: CheckpointRecord): CheckpointRecord {
+  const sessionState = readRecord(checkpoint, "sessionState");
+  if (sessionState.version !== 2) refuse("durable session version is not 2");
+  const snapshot = readRecord(sessionState, "snapshot");
+  const session = readRecord(snapshot, "session");
+  const state = session.state === undefined ? {} : readRecord(session, "state");
+  const emission = state["eve.harness.emission"] ?? sessionState.emissionState;
+  if (
+    !isObject(emission) ||
+    typeof emission.sessionStarted !== "boolean" ||
+    !Number.isSafeInteger(emission.sequence) ||
+    (emission.sequence as number) < 0 ||
+    !Number.isSafeInteger(emission.stepIndex) ||
+    (emission.stepIndex as number) < 0 ||
+    emission.turnId !== ""
+  )
+    refuse("lifecycle position is malformed or a turn is still open");
+
+  const retiredPendingKeys = [
+    LEGACY_HITL_STATE_KEYS.signIns,
+    "eve.runtime.pendingInputBatch",
+    "eve.runtime.pendingCoordinationBatch",
+    "eve.runtime.deferredStepInput",
+    "eve.harness.pendingWorkflowInterrupt",
+  ];
+  if (retiredPendingKeys.some((key) => state[key] !== undefined))
+    refuse("session holds pending work");
+  const batches = state["eve.runtime.pendingInputBatches"];
+  if (batches !== undefined && (!Array.isArray(batches) || batches.length > 0))
+    refuse("session holds pending input");
+  const routes = state[LEGACY_HITL_STATE_KEYS.relays];
+  if (
+    sessionState.hasProxyInputRequests !== false ||
+    (routes !== undefined && (!isObject(routes) || Object.keys(routes).length > 0))
+  )
+    refuse("session holds relayed input");
+  try {
+    if (getBlockingWorkflowToolRuns(state).length > 0) refuse("session holds workflow runs");
+  } catch (error) {
+    if (error instanceof CheckpointRefusal) throw error;
+    refuse("workflow tool run registry is incompatible");
+  }
+  const approvals = state[LEGACY_HITL_STATE_KEYS.approvals];
+  if (
+    approvals !== undefined &&
+    (!isObject(approvals) ||
+      !isObject(approvals.activeCandidates) ||
+      Object.keys(approvals.activeCandidates).length > 0)
+  ) {
+    refuse("session holds approval candidates or malformed approval state");
+  }
+  const grants = state["eve.runtime.hitl.approvedTools"] ?? [];
+  if (!Array.isArray(grants) || !grants.every((grant) => typeof grant === "string"))
+    refuse("approval grants are malformed");
+  if (
+    state["eve.harness.turnState"] !== undefined ||
+    state["eve.harness.sessionProjection"] !== undefined
+  )
+    refuse("v11 checkpoint already contains machine state");
+  const projection = { ...initialSessionProjection(), nextSequence: emission.sequence as number };
+  if (emission.sessionStarted) projection.started = true;
+  const nextState: CheckpointRecord = {
+    ...omitKeys(state, [
+      "eve.harness.emission",
+      "eve.runtime.hitl.approvedTools",
+      "eve.runtime.pendingInputBatches",
+    ]),
+    "eve.harness.sessionProjection": projection,
+  };
+  if (grants.length > 0)
+    nextState["eve.harness.turnState"] = { grants: [...grants], suspended: [] };
+  const { emissionState: _emission, ...durable } = sessionState;
+  return {
+    ...checkpoint,
+    sessionState: {
+      ...durable,
+      snapshot: { ...snapshot, session: { ...session, state: nextState } },
+    },
+  };
 }
 
 function isCurrentCheckpoint(value: unknown): value is SessionCheckpoint {

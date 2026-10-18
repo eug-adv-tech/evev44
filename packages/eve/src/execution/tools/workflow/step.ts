@@ -1,5 +1,4 @@
 import { createHook, getWorkflowMetadata } from "#compiled/@workflow/core/index.js";
-import { authorizationEventFields } from "#harness/authorization-event-fields.js";
 import type { AuthorizationChallenge } from "#harness/authorization.js";
 import type { AuthorizationCallback } from "#shared/connection-types.js";
 import type { ToolContext } from "#tools/definition.js";
@@ -8,10 +7,7 @@ import {
   type WorkflowToolRunContext,
 } from "#execution/tools/workflow/ask.js";
 import { disposeHook } from "#execution/hook-ownership.js";
-import {
-  createAuthorizationRequiredEvent,
-  createAuthorizationCompletedEvent,
-} from "#protocol/message.js";
+import { runSignIn } from "#harness/session-machine/transitions.js";
 import type {
   WorkflowStepAuthorizationResult,
   WorkflowStepContext,
@@ -221,23 +217,13 @@ async function reportAuthorization(
   challenge: IdentifiedAuthorizationChallenge,
   outcome?: "authorized" | "failed",
 ): Promise<void> {
-  const eventInput = {
-    ...authorizationEventFields(challenge),
-    sequence: run.from.sequence,
-    stepIndex: run.from.stepIndex,
-    taskId: run.from.taskId,
-    turnId: run.from.turnId,
-  };
-  const event =
-    outcome === undefined
-      ? createAuthorizationRequiredEvent({
-          ...eventInput,
-          description: `Sign in to ${challenge.name} to continue.`,
-          webhookUrl: challenge.hookUrl,
-        })
-      : createAuthorizationCompletedEvent({ ...eventInput, outcome });
+  const event = runSignIn(run.from, challenge, outcome);
   const acknowledged = createHook<void>();
   try {
+    // The relay can run before this suspension registers the hook, and the
+    // session's acknowledgement skips a hook it can't find. A generated token
+    // can't conflict, so this only waits for registration.
+    await acknowledged.getConflict();
     await withAbort(
       run.owner.send({
         kind: "request",

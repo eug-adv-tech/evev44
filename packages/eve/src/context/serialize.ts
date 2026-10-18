@@ -87,9 +87,10 @@ export async function deserializeContext(
 }
 
 /**
- * Admits a context written before mount-scoped state (eve 0.68 and earlier)
- * only when every value keeps an owner in this deployment. Extension state
- * moves to its mount's key when exactly one mount uses its package namespace.
+ * Admits a context written before mount-scoped state (eve 0.68 and earlier).
+ * Extension state moves to the one mount that still defines it. Authored state
+ * nothing defines was removed, so the loader drops it as in the current layout.
+ * State that several mounts define refuses rather than guessing an owner.
  */
 async function adoptLegacyStateLayout(
   data: Record<string, unknown>,
@@ -110,20 +111,16 @@ async function adoptLegacyStateLayout(
     }
     const owners = mounts.flatMap((mount) => {
       const prefix = `${legacyPackageStateNamespace(mount.packageName)}.`;
-      return name.startsWith(prefix)
-        ? [mountedStateKeyName(mount.mountId, name.slice(prefix.length))]
-        : [];
+      if (!name.startsWith(prefix)) return [];
+      const mounted = mountedStateKeyName(mount.mountId, name.slice(prefix.length));
+      return resolveKey(mounted) === undefined ? [] : [mounted];
     });
-    const [mounted] = owners;
-    if (
-      owners.length !== 1 ||
-      mounted === undefined ||
-      resolveKey(mounted) === undefined ||
-      data[mounted] !== undefined
-    ) {
+    // Authored state cannot use `eve.`, so an unknown framework key means a
+    // checkpoint migration missed it.
+    if (owners.length > 1 || (owners.length === 0 && name.startsWith("eve."))) {
       throw new IncompatibleStateLayoutError(name);
     }
-    adopted[mounted] = value;
+    adopted[owners[0] ?? name] = value;
   }
   return adopted;
 }
@@ -142,7 +139,7 @@ function legacyPackageStateNamespace(packageName: string): string {
 export class IncompatibleStateLayoutError extends Error {
   constructor(key?: string) {
     super(
-      `Incompatible context state layout${key === undefined ? "" : ` for key "${key}"`}. Restore this session with its original deployment or start a new session; state with no unambiguous owner in this deployment cannot be carried forward.`,
+      `Incompatible context state layout${key === undefined ? "" : ` for key "${key}"`}. This deployment cannot read the saved state. Continue this session on its original deployment or start a new session.`,
     );
     this.name = "IncompatibleStateLayoutError";
   }

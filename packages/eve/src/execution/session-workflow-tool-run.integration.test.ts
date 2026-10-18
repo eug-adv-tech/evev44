@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
+import { readHitlState } from "#harness/hitl/requests.js";
+
 import { handleWorkflowToolRunMessage } from "#execution/session-workflow-tool-run.js";
+import { applyRunMessagesStep } from "#execution/tools/workflow/apply-run-messages-step.js";
 import { SessionStateCursor } from "#execution/session/state-cursor.js";
-import { applyTaskRunMessageStep } from "#execution/tasks/steps.js";
 import {
   createTask,
   markTaskRunStarted,
@@ -11,7 +13,7 @@ import {
   writeTaskTable,
 } from "#execution/tasks/table.js";
 import type { WorkflowToolRunRef } from "#execution/tools/workflow/messages.js";
-import { getProxyInputRequests } from "#harness/proxy-input-requests.js";
+
 import { createTestRuntime } from "#internal/testing/app-harness.js";
 import { containsEventSequence, filterEventsByType } from "#internal/testing/events.js";
 import { createTestSessionState } from "#internal/testing/session-state.js";
@@ -45,10 +47,12 @@ describe("handleWorkflowToolRunMessage", () => {
       created.taskId,
       "reviewer-run",
     ).table;
-    const base = createTestSessionState({
-      emissionState: { sequence: 2, sessionStarted: true, stepIndex: 0, turnId: "turn_1" },
-      sessionId: "support-session",
-    });
+    const base = createTestSessionState(
+      {
+        sessionId: "support-session",
+      },
+      { sequence: 2, stepIndex: 0, turnId: "turn_1" },
+    );
     const events: MessageStreamEvent[] = [];
     const decoder = new TextDecoder();
     const cursor = new SessionStateCursor({
@@ -65,7 +69,7 @@ describe("handleWorkflowToolRunMessage", () => {
         },
       }),
     });
-    const from: WorkflowToolRunRef = {
+    const from: WorkflowToolRunRef & { readonly taskId: string } = {
       callId: "reviewer-call",
       input: { message: "Review the release notes." },
       runId: "reviewer-run",
@@ -105,13 +109,15 @@ describe("handleWorkflowToolRunMessage", () => {
         },
       });
       await cursor.advance((state) =>
-        applyTaskRunMessageStep({
+        applyRunMessagesStep({
           ...state,
-          message: {
-            from,
-            kind: "outcome",
-            result: { error: "The reviewer's model call failed.", status: "failed" },
-          },
+          messages: [
+            {
+              from,
+              kind: "outcome",
+              result: { error: "The reviewer's model call failed.", status: "failed" },
+            },
+          ],
         }),
       );
     });
@@ -122,6 +128,6 @@ describe("handleWorkflowToolRunMessage", () => {
     expect(
       containsEventSequence(events, ["input.requested", "input.resolved", "task.settled"]),
     ).toBe(true);
-    expect(getProxyInputRequests(cursor.sessionState.snapshot.session.state).size).toBe(0);
+    expect(readHitlState(cursor.sessionState.snapshot.session.state).relays.size).toBe(0);
   });
 });

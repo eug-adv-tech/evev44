@@ -2,7 +2,6 @@ import type { MemoryDefinition, MemoryToolSet, MemoryToolsContext } from "#publi
 import { resolveApprovalPolicy } from "#approval/definition.js";
 import { loadContext } from "#context/container.js";
 import { TurnMemoryLocksKey } from "#context/keys.js";
-import { TOOL_SLUG_PATTERN } from "#discover/grammar.js";
 import { defineDynamic } from "#dynamic/definition.js";
 import { markDynamicCallbackRebind } from "#internal/dynamic-tool-rebind.js";
 import { parseJsonObject, type JsonObject } from "#shared/json.js";
@@ -33,11 +32,6 @@ export function createMemoryToolDynamicDefinition(definition: MemoryDefinition, 
           return Object.fromEntries(
             Object.entries(result).map(([key, tool]) => {
               const name = `${slot}__${key}`;
-              if (!TOOL_SLUG_PATTERN.test(name)) {
-                throw new Error(
-                  `Memory provider tool name "${name}" must start with an ASCII letter, contain only letters, digits, underscores, or dashes, and be at most 64 characters.`,
-                );
-              }
               if (!isBrandedToolEntry(tool)) {
                 throw new Error(
                   `Memory provider tool "${name}" must be created with defineTool().`,
@@ -67,14 +61,26 @@ function createProviderToolCallbacks(input: {
   readonly key: string;
   readonly tool: MemoryToolSet[string];
 }) {
-  const closure = parseJsonObject({ context: input.context, key: input.key });
+  // History and turn input stay out of the durable closure: both are already
+  // durable session state and can hold non-JSON values (dates, bytes, staged
+  // attachment URLs). Replay reuses the values this process resolved with.
+  const {
+    messages,
+    turn: { input: turnInput, ...turn },
+    ...durableContext
+  } = input.context;
+  const closure = parseJsonObject({ context: { ...durableContext, turn }, key: input.key });
   const loadTool = async (rawClosure: JsonObject) => {
     const key = rawClosure.key;
     const context = rawClosure.context;
     if (typeof key !== "string" || typeof context !== "object" || context === null) {
       throw new Error("Memory provider tool callback has an invalid durable closure.");
     }
-    const tools = await input.definition.provider.tools?.(readMemoryToolsContext(context));
+    const durable = readMemoryToolsContext({ ...context, messages });
+    const tools = await input.definition.provider.tools?.({
+      ...durable,
+      turn: { ...durable.turn, input: turnInput },
+    });
     const tool = tools?.[key];
     if (tool === undefined || !isBrandedToolEntry(tool)) {
       throw new Error(`Memory provider tool "${key}" was removed or renamed.`);

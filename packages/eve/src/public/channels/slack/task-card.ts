@@ -17,6 +17,7 @@ import type { SlackHandle } from "#public/channels/slack/api.js";
 import type { BlockKitBlock } from "#public/channels/slack/blocks.js";
 import { truncateMessageText } from "#public/channels/slack/limits.js";
 import type { SlackTaskCard } from "#public/channels/slack/renderers.js";
+import { restoreStatus } from "#public/channels/slack/thread-status.js";
 import type {
   SlackChannelInternalEvents,
   SlackChannelState,
@@ -55,7 +56,7 @@ interface SlackTaskObject {
  * eve's default task card: a `task_card` block for one task, or a `plan` block
  * for several, and no card for a turn that started none. A settled task shows
  * one line about how it ended and how long it took. A task the model cancelled
- * with `task_cancel` shows as done, since it no longer needed the work; a
+ * with `eve__task_cancel` shows as done, since it no longer needed the work; a
  * failed task, or one stopped any other way, shows as an error.
  */
 export function renderDefaultSlackTaskCard(view: TaskCardView): SlackTaskCard | null {
@@ -137,7 +138,7 @@ function shownDuration(ms: number): string | undefined {
   return Number.isFinite(ms) && ms >= MIN_SHOWN_DURATION_MS ? formatDuration(ms) : undefined;
 }
 
-/** A task stopped before it finished for any reason but the model's own `task_cancel`. */
+/** A task stopped before it finished for any reason but the model's own `eve__task_cancel`. */
 function isInterrupted(task: TaskCardTask): boolean {
   return task.status === "cancelled" && task.cancelReason !== "task_cancel";
 }
@@ -406,6 +407,8 @@ async function writeTaskCard(
         ...channel.state.taskCards,
         [turnId]: { fingerprint, ts, turn: current.turn },
       };
+      // Slack clears the thread status when the app posts, but the turn works on.
+      if (ts !== current.ts && view.state === "working") await restoreStatus(channel);
     }
   }
   if (view.state === "finished") forgetTurn(channel.state, turnId);

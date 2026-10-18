@@ -1,4 +1,7 @@
+import { queuedInput, storedProjection } from "#harness/session-machine/view.js";
+import { openInputs, openSignIns } from "#protocol/session-projection.js";
 import { getBlockingWorkflowToolRuns } from "#harness/workflow-tool-runs.js";
+import { holdsHitlRequests } from "#harness/hitl/index.js";
 import {
   EntityConflictError,
   RunExpiredError,
@@ -13,24 +16,30 @@ import {
 } from "#execution/session/handoff.js";
 import { createLogger, logError } from "#internal/logging.js";
 import { cancelRun, getWorld, resumeHook } from "#internal/workflow/runtime.js";
+import { resolveInstalledPackageInfo } from "#internal/application/package.js";
+import {
+  EVE_SESSION_ATTRIBUTE,
+  EVE_VERSION_ATTRIBUTE,
+} from "#execution/eve-workflow-attributes.js";
 import { getResolvedRuntimeAgentNode } from "#runtime/graph.js";
 import { BundleKey } from "#runtime/sessions/runtime-context-keys.js";
 import { getSandboxEnvironmentRuntime } from "#shared/sandbox-environment.js";
 import { walkCauseChain } from "#shared/errors.js";
-import { isObject } from "#shared/guards.js";
 
 const log = createLogger("execution.handoff");
 
 /** Parses retained work with this deployment's code before deciding whether it can move. */
-export function isSessionStateIdleForHandoff(sessionState: DurableSessionState): boolean {
-  const { state } = readDurableSession(sessionState);
+export function isSessionStateIdleForHandoff(input: {
+  readonly sessionState: DurableSessionState;
+}): boolean {
+  const { state } = readDurableSession(input.sessionState);
   // Decoding the run registry rejects corrupt state before any busy-work shortcut.
   const workflowToolRuns = getBlockingWorkflowToolRuns(state);
 
   // These registries are deleted when work settles. Their ordinary readers
   // tolerate malformed values as absent; that must not authorize a handoff.
+  if (holdsHitlRequests(state)) return false;
   const pendingKeys = [
-    "eve.runtime.pendingAuthorization",
     "eve.runtime.pendingInputBatch",
     "eve.runtime.pendingCoordinationBatch",
     "eve.runtime.deferredStepInput",
@@ -39,13 +48,14 @@ export function isSessionStateIdleForHandoff(sessionState: DurableSessionState):
   if (pendingKeys.some((key) => state?.[key] !== undefined)) return false;
   const batches = state?.["eve.runtime.pendingInputBatches"];
   if (batches !== undefined && (!Array.isArray(batches) || batches.length > 0)) return false;
-  const proxyRequests = state?.["eve.runtime.proxyInputRequests"];
-  if (
-    proxyRequests !== undefined &&
-    (!isObject(proxyRequests) || Object.keys(proxyRequests).length > 0)
-  )
-    return false;
-  return workflowToolRuns.length === 0;
+  const projection = storedProjection(state);
+  return (
+    workflowToolRuns.length === 0 &&
+    projection.activeTurnId === undefined &&
+    openInputs(projection).length === 0 &&
+    openSignIns(projection).length === 0 &&
+    queuedInput(state) === undefined
+  );
 }
 
 /** Reads durable work using the source deployment's handoff contract. */
@@ -53,7 +63,7 @@ export async function isSessionIdleForHandoffStep(input: {
   readonly sessionState: DurableSessionState;
 }): Promise<boolean> {
   "use step";
-  return isSessionStateIdleForHandoff(input.sessionState);
+  return isSessionStateIdleForHandoff(input);
 }
 
 export type SessionCheckpointValidation =
@@ -99,7 +109,13 @@ export async function validateSessionCheckpointStep(input: {
   const bundle = context.require(BundleKey);
   const session = readDurableSession(checkpoint.sessionState);
   const sandboxState = session.sandboxState?.session;
-  if (sandboxState !== null && sandboxState !== undefined) {
+  // A record without `providerName` predates the provider redesign (eve 0.64)
+  // and is ignored at runtime, so it must not block the handoff.
+  if (
+    sandboxState !== null &&
+    sandboxState !== undefined &&
+    sandboxState.providerName !== undefined
+  ) {
     const definition =
       getResolvedRuntimeAgentNode(bundle.graph, bundle.nodeId).sandboxRegistry.sandbox.inheritance
         ?.definition ??
@@ -115,7 +131,7 @@ export async function validateSessionCheckpointStep(input: {
       throw new Error("Session checkpoint sandbox provider state is incompatible.");
     }
   }
-  if (!isSessionStateIdleForHandoff(checkpoint.sessionState)) {
+  if (!isSessionStateIdleForHandoff(checkpoint)) {
     throw new Error("Session checkpoint contains pending work and cannot be handed off.");
   }
   return { kind: "valid" };
@@ -165,6 +181,26 @@ export async function reportSessionHandoffRetainedStep(input: {
     ...input,
     checkpointVersion: SESSION_CHECKPOINT_VERSION,
   });
+}
+
+/**
+ * Records the identity of an owner that this deployment's code did not start
+ * (a handoff successor or a legacy importer) before it claims any hook:
+ * ingress reads `$eve.version` to decide whether the owner can run, so a
+ * missing value would strand a healthy session. The value comes from this
+ * step's code, not the previous owner's. Unlike observability attributes, a
+ * failed write fails the boot.
+ */
+export async function recordSessionOwnerStep(input: { readonly sessionId: string }): Promise<void> {
+  "use step";
+  const { setAttributes } = await import("#compiled/@workflow/core/index.js");
+  await setAttributes(
+    {
+      [EVE_SESSION_ATTRIBUTE]: input.sessionId,
+      [EVE_VERSION_ATTRIBUTE]: resolveInstalledPackageInfo().version,
+    },
+    { allowReservedAttributes: true },
+  );
 }
 
 export async function signalSessionOwnerActivationStep(input: {

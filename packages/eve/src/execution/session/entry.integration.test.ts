@@ -4,7 +4,7 @@ import { hydrateWorkflowArguments } from "@workflow/core/serialization";
 import { createChannelAddress } from "#channel/channel-address.js";
 import { captureTurnEvents, filterEventsByType } from "#internal/testing/events.js";
 import { createTestRuntime } from "#internal/testing/app-harness.js";
-import { waitForHook } from "#internal/testing/workflow-test-helpers.js";
+import { waitForHook, startSessionOwner } from "#internal/testing/workflow-test-helpers.js";
 import { createBundledRuntimeCompiledArtifactsSource } from "#runtime/compiled-artifacts-source.js";
 import { workflowEntry } from "#execution/session/entry.js";
 import {
@@ -18,6 +18,7 @@ import {
 import { createWorkflowRuntime } from "#execution/workflow-runtime.js";
 import { normalizeEveAttributes } from "#runtime/attributes/normalize.js";
 import { defineHook } from "#public/definitions/hook.js";
+import { defineDynamic } from "#dynamic/definition.js";
 import { sessions } from "#public/server/index.js";
 import type { MessageStreamEvent } from "#protocol/message.js";
 import { isEventId } from "#internal/testing/event-id.js";
@@ -26,13 +27,19 @@ import { always } from "#tools/approval/policies.js";
 import { defineTool } from "#tools/definition.js";
 import { ConnectionAuthorizationRequiredError } from "#connections/errors.js";
 import { defineInteractiveAuthorization } from "#shared/connection-types.js";
-import { SessionTitleKey } from "#context/keys.js";
+import {
+  SessionTitleKey,
+  ScheduleIdKey,
+  ScheduleInstanceKey,
+  OccurrenceIdKey,
+} from "#context/keys.js";
 import {
   buildSerializedContext,
   captureEvents,
   expectHookClaims,
   expectSingleTurn,
   listCallerStepNames,
+  listConditionalStepNames,
   withTimeout,
 } from "#internal/testing/entry-test-helpers.js";
 import { captureConsoleOutput, workflowSdkNotice } from "#internal/testing/log-records.js";
@@ -42,6 +49,105 @@ afterEach(() => {
 });
 
 describe("workflowEntry integration", () => {
+  it("preserves scheduled provenance in the first turn so unattended tools need no approval", async () => {
+    const executions: unknown[] = [];
+    const runtime = await createTestRuntime({
+      agent: { name: "scheduled-first-turn" },
+      modules: [
+        {
+          logicalPath: "tools/inspect_schedule.ts",
+          loadNamespace: async () => ({
+            default: defineTool({
+              description: "Report this turn's schedule provenance.",
+              inputSchema: {},
+              approval: ({ session }) =>
+                session.schedule === undefined ? "user-approval" : "not-applicable",
+              execute: (_input, context) => {
+                executions.push(context.session.schedule);
+                return { inspected: true };
+              },
+            }),
+          }),
+        },
+      ],
+    });
+    await runtime.run(async () => {
+      const run = await start(workflowEntry, [
+        {
+          kind: "initial",
+          ownerDeploymentId: "dpl_inline",
+          input: { message: "Use inspect_schedule exactly once." },
+          serializedContext: {
+            ...buildSerializedContext({ channelKind: "schedule" }),
+            [ScheduleIdKey.name]: "tasks",
+            [ScheduleInstanceKey.name]: "joke--id",
+            [OccurrenceIdKey.name]: "exec-1",
+            "eve.capabilities": { requestInput: false },
+          },
+        },
+      ]);
+      const stream = captureTurnEvents(run);
+      try {
+        const events = await stream.nextTurn();
+        expect(filterEventsByType(events, "input.requested")).toHaveLength(0);
+        expect(filterEventsByType(events, "turn.failed")).toHaveLength(0);
+        expect(executions).toEqual([
+          { definition: "tasks", instance: "joke--id", occurrenceId: "exec-1" },
+        ]);
+      } finally {
+        stream.dispose();
+        await run.cancel();
+      }
+    });
+  });
+  it("registers first-turn abort hooks before a prewarmed session receives a message", async () => {
+    const runtime = await createTestRuntime({ agent: { name: "workflow-entry-turn-prewarm" } });
+
+    await runtime.run(async () => {
+      const run = await start(workflowEntry, [
+        {
+          kind: "initial",
+          ownerDeploymentId: "dpl_inline",
+          input: {},
+          serializedContext: buildSerializedContext({ channelKind: "http" }),
+          sessionTimeoutMs: false,
+        },
+      ]);
+      const stream = captureTurnEvents(run);
+      try {
+        await waitForHook(
+          { runId: run.runId },
+          { token: sessionInboxHookToken(sessionCommandHookToken(run.runId)) },
+        );
+        let abortTokensBeforeMessage: string[] = [];
+        await vi.waitFor(async () => {
+          abortTokensBeforeMessage = (
+            await (await getWorld()).hooks.list({ runId: run.runId })
+          ).data
+            .map((hook) => hook.token)
+            .filter((token) => token.startsWith("abrt_"));
+          expect(abortTokensBeforeMessage).toHaveLength(2);
+        });
+
+        await resumeHook(sessionInboxHookToken(sessionCommandHookToken(run.runId)), {
+          kind: "send",
+          payload: { message: "Say hello." },
+        });
+        await stream.nextTurn();
+
+        const abortTokensAfterTurn = (
+          await (await getWorld()).hooks.list({ runId: run.runId })
+        ).data
+          .map((hook) => hook.token)
+          .filter((token) => token.startsWith("abrt_"));
+        expect(abortTokensAfterTurn).toEqual(abortTokensBeforeMessage);
+      } finally {
+        stream.dispose();
+        await run.cancel();
+      }
+    });
+  });
+
   it("parks before initialization and initializes with the first message identity and title", async () => {
     let initializedSessions = 0;
     let initializedAuth: unknown;
@@ -67,7 +173,7 @@ describe("workflowEntry integration", () => {
     });
 
     await runtime.run(async () => {
-      const run = await start(workflowEntry, [
+      const run = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -85,8 +191,8 @@ describe("workflowEntry integration", () => {
           { runId: run.runId },
           { token: sessionInboxHookToken(sessionCommandHookToken(run.runId)) },
         );
-        await expectHookClaims(run.runId, [sessionCommandHookToken(run.runId)], {
-          turnStarted: false,
+        await vi.waitFor(async () => {
+          await expectHookClaims(run.runId, [sessionCommandHookToken(run.runId)]);
         });
 
         const sessionRuntime = createWorkflowRuntime({
@@ -150,7 +256,7 @@ describe("workflowEntry integration", () => {
     });
     try {
       await runtime.run(async () => {
-        const run = await start(workflowEntry, [
+        const run = await startSessionOwner(workflowEntry, [
           {
             kind: "initial",
             ownerDeploymentId: "dpl_inline",
@@ -185,7 +291,7 @@ describe("workflowEntry integration", () => {
     const continuationToken = "http:workflow-entry-conversation";
 
     await runtime.run(async () => {
-      const run = await start(workflowEntry, [
+      const run = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -270,6 +376,8 @@ describe("workflowEntry integration", () => {
         await expect(run.returnValue).resolves.toEqual({ output: "" });
         completed = true;
         expect(await listCallerStepNames(run.runId)).toEqual([]);
+        // Two ordinary turns and a reset have no runs, tasks, or caller to act on.
+        expect(await listConditionalStepNames(run.runId)).toEqual([]);
       } finally {
         stream.dispose();
         if (!completed) await run.cancel();
@@ -278,11 +386,140 @@ describe("workflowEntry integration", () => {
     expect(output.unexpected(workflowSdkNotice.unpinnedDelivery)).toEqual([]);
   });
 
+  it("parks a failed dynamic connection rehydration and accepts the next message", async () => {
+    let shouldFail = false;
+    const continuationToken = "http:workflow-entry-dynamic-connection-failure";
+    const runtime = await createTestRuntime({
+      agent: { name: "workflow-entry-dynamic-connection-failure" },
+      modules: [
+        {
+          logicalPath: "connections/accounts.ts",
+          loadNamespace: async () => ({
+            default: defineDynamic({
+              events: {
+                "session.started": () => {
+                  if (shouldFail) throw new Error("account store unavailable");
+                  return null;
+                },
+              },
+            }),
+          }),
+        },
+      ],
+    });
+
+    await runtime.run(async () => {
+      const run = await start(workflowEntry, [
+        {
+          kind: "initial",
+          ownerDeploymentId: "dpl_inline",
+          input: { message: "first message" },
+          serializedContext: buildSerializedContext({
+            channelKind: "http",
+            continuationToken,
+          }),
+        },
+      ]);
+      const stream = captureTurnEvents(run);
+      const inboxToken = sessionInboxHookToken(continuationToken);
+
+      try {
+        expect((await stream.nextTurn()).at(-1)?.type).toBe("session.waiting");
+
+        await waitForHook({ runId: run.runId }, { token: inboxToken });
+        shouldFail = true;
+        await resumeHook(inboxToken, {
+          kind: "send",
+          payload: { message: "failed message" },
+        });
+
+        const failedTurn = await stream.nextTurn();
+        expect(failedTurn.at(-1)?.type).toBe("session.waiting");
+        expect(filterEventsByType(failedTurn, "turn.failed")).toHaveLength(1);
+        expect(filterEventsByType(failedTurn, "session.failed")).toHaveLength(0);
+
+        shouldFail = false;
+        await resumeHook(inboxToken, {
+          kind: "send",
+          payload: { message: "recovered message" },
+        });
+
+        const recoveredTurn = await stream.nextTurn();
+        expect(recoveredTurn.at(-1)?.type).toBe("session.waiting");
+        expect(filterEventsByType(recoveredTurn, "session.failed")).toHaveLength(0);
+      } finally {
+        stream.dispose();
+        await run.cancel();
+      }
+    });
+  });
+
+  it("parks a dynamic connection failure on the first message and accepts the next message", async () => {
+    let shouldFail = true;
+    const continuationToken = "http:workflow-entry-dynamic-connection-first-failure";
+    const runtime = await createTestRuntime({
+      agent: { name: "workflow-entry-dynamic-connection-first-failure" },
+      modules: [
+        {
+          logicalPath: "connections/accounts.ts",
+          loadNamespace: async () => ({
+            default: defineDynamic({
+              events: {
+                "session.started": () => {
+                  if (shouldFail) throw new Error("account store unavailable");
+                  return null;
+                },
+              },
+            }),
+          }),
+        },
+      ],
+    });
+
+    await runtime.run(async () => {
+      const run = await start(workflowEntry, [
+        {
+          kind: "initial",
+          ownerDeploymentId: "dpl_inline",
+          input: { message: "first message" },
+          serializedContext: buildSerializedContext({
+            channelKind: "http",
+            continuationToken,
+          }),
+        },
+      ]);
+      const stream = captureTurnEvents(run);
+      const inboxToken = sessionInboxHookToken(continuationToken);
+
+      try {
+        const failedTurn = await stream.nextTurn();
+        expect(failedTurn.at(-1)?.type).toBe("session.waiting");
+        expect(filterEventsByType(failedTurn, "turn.failed")).toHaveLength(1);
+        expect(filterEventsByType(failedTurn, "session.failed")).toHaveLength(0);
+
+        await waitForHook({ runId: run.runId }, { token: inboxToken });
+        shouldFail = false;
+        await resumeHook(inboxToken, {
+          kind: "send",
+          payload: { message: "recovered message" },
+        });
+
+        const recoveredTurn = await stream.nextTurn();
+        expect(recoveredTurn.at(-1)?.type).toBe("session.waiting");
+        expect(filterEventsByType(recoveredTurn, "turn.failed")).toHaveLength(0);
+        expect(filterEventsByType(recoveredTurn, "session.failed")).toHaveLength(0);
+      } finally {
+        stream.dispose();
+        await run.cancel();
+      }
+    });
+  });
+
   it("publishes the session ID as the waiting address for an ID-only session", async () => {
     const runtime = await createTestRuntime({ agent: { name: "workflow-entry-id-only" } });
 
     await runtime.run(async () => {
-      const run = await start(workflowEntry, [
+      const run = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -312,7 +549,7 @@ describe("workflowEntry integration", () => {
     const continuationToken = "http:workflow-entry-event-ids";
 
     await runtime.run(async () => {
-      const run = await start(workflowEntry, [
+      const run = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -398,7 +635,7 @@ describe("workflowEntry integration", () => {
     });
 
     await runtime.run(async () => {
-      const run = await start(workflowEntry, [
+      const run = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -445,7 +682,7 @@ describe("workflowEntry integration", () => {
     });
 
     await runtime.run(async () => {
-      const run = await start(workflowEntry, [
+      const run = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -511,7 +748,7 @@ describe("workflowEntry integration", () => {
     const childContinuationToken = "subagent:parent-session:call-1";
 
     await runtime.run(async () => {
-      const child = await start(workflowEntry, [
+      const child = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -577,8 +814,6 @@ describe("workflowEntry integration", () => {
           ],
         });
         expect(await listCallerStepNames(child.runId)).toEqual([
-          "bindTurnCallerContextStep",
-          "bindTurnCallerContextStep",
           "notifyTurnCallerStep",
           "notifyTurnCallerStep",
           "resolveInitialTurnCallerStep",
@@ -613,7 +848,7 @@ describe("workflowEntry integration", () => {
     const firstCallerToken = "subagent:parent-session:call-1";
 
     await runtime.run(async () => {
-      const child = await start(workflowEntry, [
+      const child = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -848,6 +1083,136 @@ describe("workflowEntry integration", () => {
     );
   }, 60_000);
 
+  it("lets a queued message sent after the approval appeared steer before the step returns", async () => {
+    const executions: string[] = [];
+    const approvalShown = Promise.withResolvers<void>();
+    const releaseStep = Promise.withResolvers<void>();
+    const holdStepOpen = {
+      logicalPath: "hooks/hold-step-open.ts",
+      loadNamespace: async () => ({
+        default: defineHook({
+          events: {
+            // Keeps the step that raised the approval running after it was
+            // published, the window a client that reacts at once lands in.
+            async "input.requested"() {
+              approvalShown.resolve();
+              await releaseStep.promise;
+            },
+          },
+        }),
+      }),
+    };
+    await withHeldApprovalRun(
+      {
+        agent: { name: "workflow-entry-steer-held-before-boundary" },
+        auth: ALICE,
+        modules: [gatedTool("approve_change", executions), holdStepOpen],
+      },
+      async ({ sessionInbox, stream }) => {
+        await withTimeout(approvalShown.promise, "approval shown");
+        await resumeHook(sessionInbox, {
+          auth: ALICE,
+          kind: "send",
+          payload: { message: "Never mind, just say hello." },
+          turnPolicy: "queue",
+        });
+        // Let the session accept the message before the step returns.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        releaseStep.resolve();
+
+        const held = await withTimeout(stream.nextTurn(), "approval hold");
+        const request = filterEventsByType(held, "input.requested")[0]?.data.requests[0];
+        expect(held.at(-1)?.type).toBe("turn.waiting");
+        const steered = await withTimeout(stream.nextTurn(), "steered turn");
+        expect(filterEventsByType(steered, "input.resolved")).toMatchObject([
+          { data: { resolutions: [{ outcome: "ignored", requestId: request!.requestId }] } },
+        ]);
+        expect(steered.at(-1)?.type).toBe("session.waiting");
+        expect(executions).toEqual([]);
+      },
+    );
+  }, 60_000);
+
+  // https://github.com/vercel/eve/issues/786
+  it("keeps a queued message sent before an approval queued instead of answering it", async () => {
+    const executions: string[] = [];
+    const lookupStarted = Promise.withResolvers<void>();
+    const releaseLookup = Promise.withResolvers<void>();
+    const lookup = {
+      loadNamespace: async () => ({
+        default: defineTool({
+          description: "Look up the change to apply.",
+          execute: async () => {
+            lookupStarted.resolve();
+            await releaseLookup.promise;
+            return { stepKey: "change-1" };
+          },
+          inputSchema: {},
+        }),
+      }),
+      logicalPath: "tools/lookup_change.ts",
+    };
+    await withHeldApprovalRun(
+      {
+        agent: { name: "workflow-entry-stale-queued-approval" },
+        auth: ALICE,
+        message: "Use lookup_change, then approve_change.",
+        modules: [
+          lookup,
+          gatedTool("approve_change", executions, {
+            request: always(),
+            response: async () => ({ status: "allowed" as const }),
+          }),
+        ],
+      },
+      async ({ commandInbox, sessionInbox, stream }) => {
+        await withTimeout(lookupStarted.promise, "lookup started");
+        // Alice types while the turn runs, before any approval exists.
+        await resumeHook(sessionInbox, {
+          auth: ALICE,
+          kind: "send",
+          payload: { message: "approve" },
+          turnPolicy: "queue",
+        });
+        // Let the session admit the message before the step ends.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        releaseLookup.resolve();
+
+        const held = await withTimeout(stream.nextTurn(), "approval hold");
+        const request = filterEventsByType(held, "input.requested")[0]?.data.requests[0];
+        expect(request?.action.toolName).toBe("approve_change");
+        expect(held.at(-1)).toMatchObject({ data: { on: "input" }, type: "turn.waiting" });
+        expect(filterEventsByType(held, "approval.settled")).toHaveLength(0);
+        expect(executions).toEqual([]);
+
+        // Bob approves, so the settlement shows who answered.
+        await resumeHook(commandInbox, {
+          auth: BOB,
+          kind: "send",
+          payload: { inputResponses: [{ optionId: "approve", requestId: request!.requestId }] },
+        });
+        // The approval settles first; the queued message then runs as an ordinary message.
+        const answered = await withTimeout(
+          stream.nextUntil((event) => event.type === "message.received"),
+          "queued message",
+        );
+        expect(filterEventsByType(answered, "approval.settled")).toMatchObject([
+          {
+            data: {
+              outcome: "approved",
+              requestId: request!.requestId,
+              responderPrincipalId: expect.stringContaining("bob"),
+            },
+          },
+        ]);
+        expect(filterEventsByType(answered, "message.received").at(-1)?.data.message).toBe(
+          "approve",
+        );
+        expect(executions).toEqual(["approve_change"]);
+      },
+    );
+  }, 60_000);
+
   it("runs a steering message after the budget prompt that followed its cancelled approval", async () => {
     await withHeldApprovalRun(
       {
@@ -942,12 +1307,37 @@ describe("workflowEntry integration", () => {
     );
   }, 60_000);
 
+  it("reads a message in the first step after its approval turn is cancelled", async () => {
+    const executions: string[] = [];
+    await withHeldApprovalRun(
+      {
+        agent: { name: "workflow-entry-cancelled-approval-follow-up" },
+        modules: [gatedTool("approve_change", executions)],
+      },
+      async ({ commandInbox, sessionInbox, stream }) => {
+        await withTimeout(stream.nextTurn(), "approval turn");
+        await resumeHook(sessionInbox, { kind: "cancel" });
+        await withTimeout(stream.nextTurn(), "cancelled turn");
+
+        await resumeHook(commandInbox, {
+          kind: "send",
+          payload: { message: "Reply with the follow-up." },
+        });
+        const followUp = await withTimeout(stream.nextTurn(), "follow-up turn");
+        // The model reads the cancelled call's result and the message in one step.
+        expect(filterEventsByType(followUp, "step.started")).toHaveLength(1);
+        expect(filterEventsByType(followUp, "message.completed")).toHaveLength(1);
+        expect(executions).toEqual([]);
+      },
+    );
+  }, 60_000);
+
   it("exits a competing continuation owner before its first turn", async () => {
     const runtime = await createTestRuntime({ agent: { name: "workflow-entry-hook-owner" } });
     const continuationToken = "http:workflow-entry-hook-owner";
 
     await runtime.run(async () => {
-      const owner = await start(workflowEntry, [
+      const owner = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -967,7 +1357,7 @@ describe("workflowEntry integration", () => {
       const firstTurn = await ownerStream.nextTurn();
       expect(firstTurn.at(-1)?.type).toBe("session.waiting");
 
-      const contender = await start(workflowEntry, [
+      const contender = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -1015,7 +1405,7 @@ describe("workflowEntry integration", () => {
     } as const;
 
     await runtime.run(async () => {
-      const run = await start(workflowEntry, [
+      const run = await startSessionOwner(workflowEntry, [
         {
           kind: "initial",
           ownerDeploymentId: "dpl_inline",
@@ -1374,7 +1764,7 @@ async function withHeldApprovalRun(
   };
   if (options.auth !== undefined) context.auth = options.auth;
   await runtime.run(async () => {
-    const run = await start(workflowEntry, [
+    const run = await startSessionOwner(workflowEntry, [
       {
         kind: "initial",
         ownerDeploymentId: "dpl_inline",

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ClientError } from "#client/client-error.js";
+import { ClientError, ClientSessionStrandedError } from "#client/client-error.js";
 import { ClientSession } from "#client/session.js";
 import type { ClientSessionState } from "#client/types.js";
 import {
@@ -191,6 +191,8 @@ describe("ClientSession", () => {
     const requestUrl = new URL(requests[0]!);
     expect(requestUrl.searchParams.get("startIndex")).toBeNull();
     expect(requestUrl.searchParams.get("includeTailIndex")).toBe("1");
+    // A bounded read asks for history only, which a stranded session still serves.
+    expect(requestUrl.searchParams.get("follow")).toBe("false");
     expect(snapshot.events.map((event) => event.type)).toEqual(["turn.started", "session.waiting"]);
     expect(snapshot.session).toEqual({
       sessionId: "session_1",
@@ -269,6 +271,23 @@ describe("ClientSession", () => {
       session: { sessionId: "session_1", streamIndex: 0 },
     });
     expect(session.state).toBe(initialState);
+  });
+
+  it("snapshots with an AbortSignal that has no throwIfAborted", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(createBoundedStreamResponse([]));
+    const session = createSession();
+    const descriptor = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "throwIfAborted");
+    expect(descriptor).toBeDefined();
+    delete (AbortSignal.prototype as { throwIfAborted?: unknown }).throwIfAborted;
+
+    try {
+      await expect(session.snapshot({ signal: new AbortController().signal })).resolves.toEqual({
+        events: [],
+        session: { sessionId: "session_1", streamIndex: 0 },
+      });
+    } finally {
+      Object.defineProperty(AbortSignal.prototype, "throwIfAborted", descriptor!);
+    }
   });
 
   it("does not mutate the handle when a snapshot is aborted", async () => {
@@ -396,6 +415,38 @@ describe("ClientSession", () => {
       expect(fetchMock).toHaveBeenCalledOnce();
     },
   );
+
+  it.each([
+    ["send", (session: ClientSession) => session.send("hello")],
+    [
+      "respond",
+      (session: ClientSession) => session.respond([{ requestId: "req_1", optionId: "approve" }]),
+    ],
+  ] as const)("throws a typed stranded error from %s without retrying", async (_, invoke) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json(
+        {
+          code: "session_stranded",
+          error: "This session is stranded.",
+          eveVersion: "0.0.1",
+          ok: false,
+        },
+        { status: 409 },
+      ),
+    );
+    const session = createSession({ sessionId: "session_1", streamIndex: 0 });
+
+    const error = await invoke(session).catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(ClientSessionStrandedError);
+    expect(error).toMatchObject({
+      code: "session_stranded",
+      eveVersion: "0.0.1",
+      message: "This session is stranded.",
+      status: 409,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
 
   it("does not retry session_not_ready from respond", async () => {
     const fetchMock = vi
@@ -939,7 +990,7 @@ describe("ClientSession", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it.each(["Load failed", "network error"])(
+  it.each(["network error"])(
     "does not retry an unrecognized TypeError while opening a stream: %s",
     async (message) => {
       const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError(message));

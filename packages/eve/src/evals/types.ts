@@ -1,5 +1,5 @@
 import type { TokenUsage } from "#shared/token-usage.js";
-import type { Experimental_EvaluationModel as EvaluationModel } from "ai";
+import type { Experimental_DecisionModel as DecisionModel } from "ai";
 
 import type { StandardSchemaV1 } from "#compiled/@standard-schema/spec/index.js";
 import type { ClientAgentSession } from "#client/agent-session.js";
@@ -51,6 +51,22 @@ export interface EveEvalToolCall {
 }
 
 /**
+ * One skill load extracted from the captured stream, pairing the `load-skill`
+ * request with its matching `load-skill-result`.
+ */
+export interface EveEvalSkillLoad {
+  /** The loaded skill's name. */
+  readonly skill: string;
+  /** The skill's instructions; `undefined` when the load never resolved. */
+  readonly output: JsonValue | undefined;
+  readonly status: EveEvalActionStatus;
+  /** Zero-based index of the turn the load happened in. */
+  readonly turnIndex: number;
+  /** Owning session id, when the runner knows it. */
+  readonly sessionId?: string;
+}
+
+/**
  * One call to an agent task extracted from the captured stream: its
  * `task.started`, joined with its `task.settled` and the task's
  * `agent.started`.
@@ -80,6 +96,7 @@ export interface EveEvalSubagentCall {
 export interface EveEvalDerivedFacts {
   readonly toolCalls: readonly EveEvalToolCall[];
   readonly toolCallCount: number;
+  readonly skillLoads: readonly EveEvalSkillLoad[];
   readonly subagentCalls: readonly EveEvalSubagentCall[];
   readonly subagentCallCount: number;
   /** Every HITL input request raised during the run (`input.requested`). */
@@ -185,6 +202,9 @@ export interface AssertionEvaluation {
   readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
+/** A score from 0 to 1, or an evaluation carrying one, accepted by `t.score`; may be a promise. */
+export type ScoreInput = number | AssertionEvaluation | Promise<number | AssertionEvaluation>;
+
 /**
  * A value-level assertion produced by the builders in `eve/evals/expect`
  * (e.g. `includes`, `equals`, `similarity`) and applied to an explicit value
@@ -217,21 +237,29 @@ export interface AssertionHandle {
   gate(threshold?: number): this;
   soft(threshold?: number): this;
   atLeast(threshold: number): this;
-  /** Adds a stable human-readable label to this recorded assertion. */
+  /** Sets this entry's stable `key` and appends the label to its display name. */
   label(label: string): this;
 }
 
 /**
- * The recorded outcome of one assertion, consumed by the verdict, reporters,
- * and artifacts. A boolean assertion has `score` 0 or 1.
+ * The recorded outcome of one assertion or `t.score`, consumed by the verdict,
+ * reporters, and artifacts. `score` is the measurement and a rule does not
+ * change it; `threshold` and `passed` describe the rule and are absent when
+ * none applies. A boolean assertion has `score` 0 or 1.
  */
 export interface AssertionResult {
+  /** Display name, e.g. `judge.boolean [citation]`. */
   readonly name: string;
-  readonly score: number;
+  /** Stable identifier set by `.label(key)`; absent for unlabeled assertions. */
+  readonly key?: string;
+  /** The measurement; absent when the scorer threw. */
+  readonly score?: number;
   readonly severity: AssertionSeverity;
+  /** Effective minimum passing score (a gate defaults to 1); absent when no rule applies. */
   readonly threshold?: number;
-  readonly passed: boolean;
-  /** Whether the assertion failed because its scorer threw instead of producing a score. */
+  /** Verdict of the acceptance rule; absent when no rule applies. */
+  readonly passed?: boolean;
+  /** Whether the scorer threw; an errored entry is always a failed outcome. */
   readonly errored: boolean;
   /** Human-readable failure detail, shown in console output and artifacts. */
   readonly message?: string;
@@ -244,7 +272,7 @@ export interface EveEvalAssertions {
   parked(): AssertionHandle;
   messageIncludes(token: string | RegExp): AssertionHandle;
   calledTool(name: string, options?: EveEvalToolCallMatchOptions): AssertionHandle;
-  /** Sugar for `calledTool("load_skill", { input: { skill }, ... })`. */
+  /** Asserts a completed load of `skill`, constrained like `calledTool`. */
   loadedSkill(skill: string, options?: EveEvalSkillLoadMatchOptions): AssertionHandle;
   notCalledTool(name: string): AssertionHandle;
   /** Asserts that tool requests appeared in order, allowing unrelated requests between them. */
@@ -326,6 +354,12 @@ interface EveEvalSessionDriver {
   readonly sessionId: string;
   /** Request cooperative cancellation of this session's active turn. */
   cancel(): Promise<CancelSessionResult>;
+  /**
+   * Compact this session's history between turns and wait for it to finish.
+   * Returns the compaction events through `session.waiting`; throws when the
+   * session is no longer active.
+   */
+  compact(): Promise<EveEvalTurn>;
   /** Require exactly one pending input request matching `filter`, or abort dependent control flow. */
   requireInputRequest(filter?: EveEvalInputRequestMatchOptions): InputRequest;
   /** Resolve specific pending requests and run the resumed turn. */
@@ -386,14 +420,15 @@ export interface EveEvalTurn extends EveEvalAssertions, EveEvalOutputAssertions 
 // Judge (LLM-as-judge)
 // ---------------------------------------------------------------------------
 
-/** Evaluation settings used only for scoring, independently of the agent under test. */
+/** Decision settings used only for scoring, independently of the agent under test. */
 export interface EveEvalJudgeConfig {
-  /** Evaluation model ID or instance. Defaults to the model used by `eve/ai` evaluate. */
-  readonly model?: EvaluationModel;
-  readonly modelOptions?: AgentModelOptionsDefinition;
+  /** Decision model ID or instance. Defaults to the model used by `eve/ai` decide. */
+  readonly model?: DecisionModel;
+  /** Judge calls carry provider options only; eve places no prompt-cache breakpoints on them. */
+  readonly modelOptions?: Pick<AgentModelOptionsDefinition, "providerOptions">;
 }
 
-/** JSON content accepted as evaluation state, instructions, or rubric descriptions. */
+/** JSON content accepted as decision state, instructions, or rubric descriptions. */
 export type JudgeInput = string | JsonObject | readonly JsonValue[];
 
 /** A boolean judgment, ordered rubric, or categorical judgment with an expected option. */
@@ -420,7 +455,7 @@ export type JudgeQuestionConstraint<Q extends JudgeQuestion> = Q extends { type:
   ? { readonly expected: NoInfer<Extract<keyof Q["criteria"], string>> }
   : unknown;
 
-/** Named judgments evaluated together against one shared state. */
+/** Named judgments decided together against one shared state. */
 export interface JudgeBatch<Questions extends Record<string, JudgeQuestion>> {
   /** Replaces the default `{ input, output }` state when supplied. */
   readonly state?: JudgeInput;
@@ -476,6 +511,12 @@ export interface EveEvalContext<TContext = unknown> extends EveEvalAssertions {
 
   /** Apply a value-level assertion (from `eve/evals/expect`) to a value. */
   check(value: unknown, assertion: Assertion): AssertionHandle;
+  /**
+   * Record a score from 0 to 1. Chain `.label(key)` to name it, `.gate(0.9)`
+   * to fail the eval below 0.9, or `.atLeast(0.9)` to mark it `scored`.
+   * Without a rule the score has no verdict.
+   */
+  score(evaluation: ScoreInput): AssertionHandle;
   /** Record an immediate gate and abort dependent control flow when it fails. */
   require<T>(value: T, assertion: Assertion): Promise<T>;
   /** Mark this eval as intentionally skipped and stop executing its test body. */
@@ -551,7 +592,7 @@ interface EveEvalBase {
   /**
    * Judge model for this eval's `t.judge(...)` assertions. Optional: when
    * omitted, judge assertions fall back to the `judge` declared in
-   * `evals.config.ts`, then the shared evaluation default. Only used for
+   * `evals.config.ts`, then the shared decision default. Only used for
    * scoring; never changes the agent under test.
    */
   readonly judge?: EveEvalJudgeConfig;
@@ -678,7 +719,7 @@ export interface EveEvalConfigInput<TContext = unknown> {
   teardown?(context: TContext | undefined): void | Promise<void>;
   /**
    * Default judge model for `t.judge(...)` assertions across every eval.
-   * Optional: omission uses the shared evaluation default. Individual evals
+   * Optional: omission uses the shared decision default. Individual evals
    * may override it with their own `judge`. Only ever used for scoring.
    */
   readonly judge?: EveEvalJudgeConfig;

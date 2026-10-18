@@ -1,6 +1,11 @@
 import { defaultDeliverResult } from "#channel/adapter.js";
 import type { TeamsInstrumentationMetadata } from "#public/channels/teams/index.js";
 import type { ChannelFrom, ChannelResolveSession } from "#channel/channel-operations.js";
+import {
+  INACTIVE_REQUEST_NOTICE,
+  respondOrRetireInactivePrompt,
+  type PromptResponse,
+} from "#channel/inactive-prompt.js";
 import type { SessionHandle } from "#channel/session.js";
 import type { SessionAuthContext, TurnPolicy } from "#channel/types.js";
 import type { SessionContext } from "#public/definitions/callback-context.js";
@@ -35,6 +40,11 @@ import {
   type TeamsPostedActivity,
 } from "#public/channels/teams/api.js";
 import {
+  answerTeamsAuthorizationReveal,
+  readTeamsAuthorizationReveal,
+  type TeamsAuthorizationReveal,
+} from "#public/channels/teams/authorization.js";
+import {
   defaultEvents,
   defaultOnMessage,
   defaultTeamsAuth,
@@ -46,6 +56,8 @@ import {
   isTeamsToolApprovalResponseActivity,
   readTeamsInputReplyToActivityId,
   readTeamsToolApprovalPrompt,
+  readTeamsInputPrompt,
+  renderInactiveInputRequestMessage,
   teamsInvokeResponse,
 } from "#public/channels/teams/hitl.js";
 import {
@@ -62,6 +74,7 @@ import { readNonEmptyString } from "#shared/guards.js";
 import { parseJsonObject, type JsonObject } from "#shared/json.js";
 import { defineChannel, POST, type Channel } from "#public/definitions/channel.js";
 import type { ChannelAudience } from "#shared/channel-audience.js";
+import type { InputOption } from "#shared/input.js";
 
 const log = createLogger("teams.channel");
 
@@ -89,12 +102,15 @@ interface TeamsChannelContext extends TeamsContext {
 /** Event-handler Teams context, including continuation routing. */
 export interface TeamsEventContext extends TeamsChannelContext, ChannelContinuationOps {}
 
-/** JSON-serializable Teams channel state. */
-export interface TeamsPendingApprovalCard {
+/** A posted question or approval card, kept until eve resolves its request. */
+export interface TeamsPendingPromptCard {
   readonly activityId: string;
+  /** A question's options, so its card can show the chosen label. */
+  readonly options?: readonly Pick<InputOption, "id" | "label">[];
   readonly prompt: string;
 }
 
+/** JSON-serializable Teams channel state. */
 export interface TeamsChannelState {
   /** Bot account captured from the inbound activity recipient. */
   bot: TeamsChannelAccount | null;
@@ -111,7 +127,7 @@ export interface TeamsChannelState {
   triggeringUser: TeamsChannelAccount | null;
   /** Activity id for the default connection-auth card, when posted. */
   pendingAuthActivityId?: string | null;
-  pendingApprovalCards?: Record<string, TeamsPendingApprovalCard>;
+  pendingPromptCards?: Record<string, TeamsPendingPromptCard>;
   approvalResponderAccounts?: Record<string, TeamsChannelAccount>;
 }
 
@@ -179,6 +195,7 @@ type TeamsSessionFailedHandler = (
 export interface TeamsChannelEvents {
   readonly "approval.candidate"?: TeamsEventHandler<"approval.candidate">;
   readonly "approval.settled"?: TeamsEventHandler<"approval.settled">;
+  readonly "input.resolved"?: TeamsEventHandler<"input.resolved">;
   readonly "turn.started"?: TeamsEventHandler<"turn.started">;
   readonly "actions.requested"?: TeamsEventHandler<"actions.requested">;
   readonly "action.partial"?: TeamsEventHandler<"action.partial">;
@@ -301,6 +318,7 @@ export function teamsChannel(config: TeamsChannelConfig = {}): TeamsChannel {
   >({
     kindHint: "teams",
     turnPolicy: config.turnPolicy,
+    uploadPolicy: config.files?.uploadPolicy,
     state: initialTeamsState(),
     fetchFile: createTeamsFetchFile(filesPolicy, {
       ...config.api,
@@ -319,11 +337,11 @@ export function teamsChannel(config: TeamsChannelConfig = {}): TeamsChannel {
 
     deliver(payload, channel) {
       const state = payload.state as Partial<TeamsChannelState> | undefined;
-      const cards = state?.pendingApprovalCards;
+      const cards = state?.pendingPromptCards;
       if (cards !== undefined) {
-        channel.state.pendingApprovalCards = {
+        channel.state.pendingPromptCards = {
           ...cards,
-          ...channel.state.pendingApprovalCards,
+          ...channel.state.pendingPromptCards,
         };
       }
       const responders = state?.approvalResponderAccounts;
@@ -357,7 +375,10 @@ export function teamsChannel(config: TeamsChannelConfig = {}): TeamsChannel {
           if (activity.type === "message") {
             waitUntil(
               isTeamsInputResponseActivity(activity)
-                ? dispatchInputResponses({ activity, config, from, onInputResponse })
+                ? // The retired card is the notice here: a message has no private reply.
+                  dispatchInputResponses({ activity, config, from, onInputResponse }).then(
+                    (answer) => (answer?.outcome === "inactive" ? answer.retirement : undefined),
+                  )
                 : dispatchMessage({
                     activity,
                     config,
@@ -375,6 +396,7 @@ export function teamsChannel(config: TeamsChannelConfig = {}): TeamsChannel {
               activity,
               config,
               onInputResponse,
+              resolveSession,
               waitUntil,
               from,
             });
@@ -671,18 +693,24 @@ async function handleInvoke(input: {
   readonly from: ChannelFrom<TeamsChannelState>;
   readonly config: TeamsChannelConfig;
   readonly onInputResponse: NonNullable<TeamsChannelConfig["onInputResponse"]>;
+  readonly resolveSession: ChannelResolveSession;
   readonly waitUntil: (task: Promise<unknown>) => void;
 }): Promise<Response> {
+  const reveal = readTeamsAuthorizationReveal(input.activity);
+  if (reveal !== null) return Response.json(await revealAuthorization({ ...input, reveal }));
+
   if (isTeamsInputResponseActivity(input.activity)) {
-    input.waitUntil(
-      dispatchInputResponses({
-        activity: input.activity,
-        config: input.config,
-        onInputResponse: input.onInputResponse,
-        from: input.from,
-      }),
-    );
-    return Response.json(teamsInvokeResponse());
+    // Answered after delivery, so the presser learns when no session took it.
+    const answer = await dispatchInputResponses({
+      activity: input.activity,
+      config: input.config,
+      onInputResponse: input.onInputResponse,
+      from: input.from,
+    });
+    if (answer?.outcome !== "inactive") return Response.json(teamsInvokeResponse());
+    // The reply doesn't wait for the card's edit, which the request still keeps.
+    input.waitUntil(answer.retirement);
+    return Response.json(teamsInvokeResponse({ message: INACTIVE_REQUEST_NOTICE }));
   }
 
   if (input.config.onInvoke === undefined) return teamsOk();
@@ -693,14 +721,49 @@ async function handleInvoke(input: {
   return teamsOk();
 }
 
+/** Identifies the presser the same way a HITL card submission does. */
+async function revealAuthorization(input: {
+  readonly activity: TeamsInvokeActivity;
+  readonly config: TeamsChannelConfig;
+  readonly onInputResponse: NonNullable<TeamsChannelConfig["onInputResponse"]>;
+  readonly resolveSession: ChannelResolveSession;
+  readonly reveal: TeamsAuthorizationReveal;
+}): Promise<JsonObject> {
+  const state = stateFromActivity(input.activity);
+  const ctx = buildTeamsBinding({ config: input.config, state });
+  let auth: SessionAuthContext | null = null;
+  try {
+    auth = (await input.onInputResponse(ctx, input.activity))?.auth ?? null;
+  } catch (error) {
+    log.error("Teams sign-in press authorization failed", { error });
+  }
+  const token = cardContinuationToken(
+    input.activity,
+    state,
+    input.reveal.replyToActivityId ?? null,
+  );
+  return await answerTeamsAuthorizationReveal({
+    adaptiveCardVersion: input.config.adaptiveCardVersion ?? "1.5",
+    auth,
+    presser: input.activity.from,
+    resolveSession: () => input.resolveSession(token),
+    reveal: input.reveal,
+  });
+}
+
+/**
+ * Delivers a card submission and reports what became of it. When no session
+ * can take it, the card's retirement has started and the caller keeps the
+ * request alive until it settles.
+ */
 async function dispatchInputResponses(input: {
   readonly activity: TeamsInvokeActivity | TeamsMessageActivity;
   readonly from: ChannelFrom<TeamsChannelState>;
   readonly config: TeamsChannelConfig;
   readonly onInputResponse: NonNullable<TeamsChannelConfig["onInputResponse"]>;
-}): Promise<void> {
+}): Promise<PromptResponse | undefined> {
   const inputResponses = deriveTeamsInputResponses(input.activity as TeamsActivity);
-  if (inputResponses.length === 0) return;
+  if (inputResponses.length === 0) return undefined;
   const state = stateFromActivity(input.activity);
   const ctx = buildTeamsBinding({ config: input.config, state });
   let result: TeamsInputResponseResult;
@@ -708,17 +771,31 @@ async function dispatchInputResponses(input: {
     result = await input.onInputResponse(ctx, input.activity);
   } catch (error) {
     log.error("Teams input response authorization failed", { error });
-    return;
+    return undefined;
   }
-  if (result === null) return;
-  try {
-    await input.from(resolveInputContinuationToken(input.activity, state)).respond(inputResponses, {
-      auth: result.auth,
-      state: approvalResponseStatePatch(input.activity, result.auth),
-    });
-  } catch (error) {
-    log.error("Teams input response delivery failed", { error });
-  }
+  if (result === null) return undefined;
+  const auth = result.auth;
+  const activity = input.activity;
+  return respondOrRetireInactivePrompt(
+    () =>
+      input
+        .from(cardContinuationToken(activity, state, readTeamsInputReplyToActivityId(activity)))
+        .respond(inputResponses, {
+          auth,
+          state: approvalResponseStatePatch(activity, auth),
+        }),
+    {
+      async retirePrompt(label) {
+        if (activity.replyToId === undefined) return;
+        // A card posted before prompts rode in its data still loses its buttons.
+        await ctx.thread.update(
+          activity.replyToId,
+          renderInactiveInputRequestMessage(readTeamsInputPrompt(activity), label),
+        );
+      },
+    },
+    log,
+  );
 }
 
 function stateFromActivity(
@@ -742,11 +819,12 @@ function stateFromActivity(
   };
 }
 
-function resolveInputContinuationToken(
+/** Continues the thread a card recorded when posted, or the activity's own thread. */
+function cardContinuationToken(
   activity: TeamsMessageActivity | TeamsInvokeActivity,
   state: TeamsChannelState,
+  replyToActivityId: string | null,
 ): string {
-  const replyToActivityId = readTeamsInputReplyToActivityId(activity);
   if (replyToActivityId === null) return stateToken(state);
   return teamsContinuationToken({
     conversationId: activity.conversation.id,
@@ -769,7 +847,7 @@ function approvalResponseStatePatch(
   }
   return {
     approvalResponderAccounts: { [auth.principalId]: activity.from },
-    pendingApprovalCards: {
+    pendingPromptCards: {
       [requestId]: {
         activityId,
         prompt: readTeamsToolApprovalPrompt(activity) ?? "Tool approval",
@@ -796,7 +874,7 @@ function initialTeamsState(): TeamsChannelState {
     conversationId: null,
     conversationType: null,
     approvalResponderAccounts: {},
-    pendingApprovalCards: {},
+    pendingPromptCards: {},
     pendingAuthActivityId: null,
     replyToActivityId: null,
     serviceUrl: null,

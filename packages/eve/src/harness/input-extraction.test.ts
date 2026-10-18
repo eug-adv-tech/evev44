@@ -5,6 +5,7 @@ import { extractToolApprovalInputRequests } from "#harness/input-extraction.js";
 describe("extractToolApprovalInputRequests", () => {
   it("extracts a tool approval request from content parts", () => {
     const result = extractToolApprovalInputRequests({
+      tools: new Map(),
       content: [
         {
           approvalId: "approval-1",
@@ -40,8 +41,42 @@ describe("extractToolApprovalInputRequests", () => {
     ]);
   });
 
+  it("uses a tool's custom approval prompt", () => {
+    const result = extractToolApprovalInputRequests({
+      content: [
+        {
+          approvalId: "approval-1",
+          toolCall: {
+            input: { amount: 125, recipient: "Ada" },
+            toolCallId: "call-1",
+            toolName: "send_payment",
+            type: "tool-call",
+          },
+          type: "tool-approval-request",
+        },
+      ],
+      tools: new Map([
+        [
+          "send_payment",
+          {
+            approval: {
+              request: () => "user-approval",
+              prompt: ({ input }) => `Send $${String(input.amount)} to ${String(input.recipient)}?`,
+            },
+            description: "Send a payment.",
+            inputSchema: {} as never,
+            name: "send_payment",
+          },
+        ],
+      ]),
+    });
+
+    expect(result[0]?.prompt).toBe("Send $125 to Ada?");
+  });
+
   it("extracts an approval request from a sibling tool call", () => {
     const result = extractToolApprovalInputRequests({
+      tools: new Map(),
       content: [
         {
           input: { command: "rm -rf /tmp" },
@@ -80,6 +115,7 @@ describe("extractToolApprovalInputRequests", () => {
 
   it("skips automatic approval decisions", () => {
     const result = extractToolApprovalInputRequests({
+      tools: new Map(),
       content: [
         {
           approvalId: "approval-1",
@@ -100,6 +136,7 @@ describe("extractToolApprovalInputRequests", () => {
 
   it("skips approval requests without matching tool-call data", () => {
     const result = extractToolApprovalInputRequests({
+      tools: new Map(),
       content: [
         {
           approvalId: "approval-1",
@@ -114,6 +151,7 @@ describe("extractToolApprovalInputRequests", () => {
 
   it("skips approval requests for excluded tool calls before parsing input", () => {
     const result = extractToolApprovalInputRequests({
+      tools: new Map(),
       content: [
         {
           input: [],
@@ -135,6 +173,7 @@ describe("extractToolApprovalInputRequests", () => {
 
   it("skips non-approval content parts", () => {
     const result = extractToolApprovalInputRequests({
+      tools: new Map(),
       content: [
         { text: "Some text.", type: "text" },
         {
@@ -150,6 +189,11 @@ describe("extractToolApprovalInputRequests", () => {
   });
 
   it("returns an empty array for empty content", () => {
-    expect(extractToolApprovalInputRequests({ content: [] })).toEqual([]);
+    expect(
+      extractToolApprovalInputRequests({
+        tools: new Map(),
+        content: [],
+      }),
+    ).toEqual([]);
   });
 });

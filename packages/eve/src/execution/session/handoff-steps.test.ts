@@ -45,6 +45,18 @@ describe("validateSessionCheckpointStep", () => {
     expect(readDurableSessionMock).toHaveBeenCalledWith(checkpoint.sessionState);
   });
 
+  it("ignores a sandbox record saved before the provider redesign", async () => {
+    deserializeContextMock.mockResolvedValue({ require: vi.fn() });
+    readDurableSessionMock.mockReturnValue({
+      sandboxState: {
+        initialized: true,
+        session: { backendName: "vercel", sessionKey: "old", metadata: {} },
+      },
+    });
+
+    await expect(validate(createCheckpoint())).resolves.toEqual({ kind: "valid" });
+  });
+
   it("rejects an incompatible workflow tool run with the current checkpoint version", async () => {
     deserializeContextMock.mockResolvedValue({ require: vi.fn() });
     readDurableSessionMock.mockReturnValue({
@@ -144,7 +156,6 @@ function createCheckpoint(): SessionCheckpoint {
     serializedContext: {},
     sessionState: createTestSessionState({
       continuationToken: "channel:current",
-      emissionState: { sequence: 0, sessionStarted: true, stepIndex: 0, turnId: "turn_0" },
       hasProxyInputRequests: false,
       sessionId: "session-1",
     }),

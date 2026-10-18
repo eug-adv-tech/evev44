@@ -1,3 +1,5 @@
+import type { Experimental_ConnectionEvents } from "#public/definitions/connections/events.js";
+import type { ConnectionEventsBackend } from "#shared/connection-events.js";
 import type { ChannelAdapter } from "#channel/adapter.js";
 import type { CompiledChannel } from "#channel/compiled-channel.js";
 import type { NormalizedChannelCorsOptions } from "#channel/cors.js";
@@ -8,7 +10,7 @@ import type { ChannelRouteMethod, RouteContext } from "#public/definitions/chann
 import type { RouteHandler, WebSocketRouteHandler } from "#channel/routes.js";
 import type { OutboundAuthFn } from "#public/agents/auth.js";
 import type { StreamEventHook } from "#public/definitions/hook.js";
-import type { Approval } from "#approval/definition.js";
+import type { Approval, ToolApproval } from "#approval/definition.js";
 import type { ToolModelOutput } from "#tools/definition.js";
 import type { ConnectionToolCallDefinition } from "#public/definitions/connections/tool-call.js";
 import type {
@@ -31,7 +33,7 @@ import type {
   MarkdownSourceRef,
 } from "#shared/source-ref.js";
 import type { NamedSkillDefinition } from "#shared/skill-definition.js";
-import type { InternalAgentDefinition } from "#shared/agent-definition.js";
+import type { InternalAgentDefinition, AgentToolExposure } from "#shared/agent-definition.js";
 import type { RuntimeDynamicModelReference } from "#runtime/agent/bootstrap.js";
 import type { InternalToolDefinitionWithExecuteFn } from "#tools/definition.js";
 import type { CompiledToolBehavior } from "#tools/behavior.js";
@@ -99,8 +101,20 @@ export type ResolvedScheduleDefinition = Readonly<
  * Both `authorization` and `headers` are optional — a connection to a
  * server that requires no authentication (e.g. localhost) may omit both.
  */
+/** A connection's event watching, checked once when the connection resolves. */
+export interface ResolvedConnectionEvents {
+  readonly callbacks: Experimental_ConnectionEvents;
+  /** The static Connect authorization every watch subscribes and runs under. */
+  readonly authorization: Readonly<AuthorizationDefinition>;
+  readonly connector: string;
+  readonly backend: ConnectionEventsBackend;
+}
+
 export interface ResolvedConnectionDefinition extends ResolvedModuleSourceRef {
+  readonly experimental_events?: ResolvedConnectionEvents;
   readonly protocolVersionDiscovery?: boolean;
+  /** MCP only: send the turn's principals in `eve-forwarded-principal`. */
+  readonly forwardPrincipal?: boolean;
   readonly approval?: Approval;
   readonly authorization?: Readonly<AuthorizationDefinition> | ConnectionAuthResolver;
   readonly connectionName: string;
@@ -173,7 +187,7 @@ export type ResolvedToolDefinition = Readonly<
      * approval is required before executing this tool. See
      * {@link Approval} for the shared callback contract.
      */
-    readonly approval?: Approval;
+    readonly approval?: ToolApproval;
     /**
      * Optional function that derives a compound approval key from the tool
      * input. When present, the runtime records this key (instead of just
@@ -274,7 +288,7 @@ export type ResolvedRuntimeSubagentNode = Readonly<
     Node & {
       kind: "subagent";
       name: string;
-      tool?: boolean;
+      tool?: AgentToolExposure;
     } & (
       | {
           description: string;
@@ -301,7 +315,7 @@ export type ResolvedRuntimeRemoteAgentNode = Readonly<
       kind: "remote";
       name: string;
       path: string;
-      tool?: boolean;
+      tool?: AgentToolExposure;
       url: string;
     }
 >;

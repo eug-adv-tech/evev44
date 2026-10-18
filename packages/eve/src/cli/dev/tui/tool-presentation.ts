@@ -1,5 +1,7 @@
 import { diffWriteDetail, type ToolDetailLine } from "./line-diff.js";
 import { stripTerminalControls } from "#cli/ui/terminal-text.js";
+import { displayName, displayTitle } from "#shared/display-name.js";
+import { REPLY_TOOL_NAME } from "#protocol/reply-tool.js";
 import { summarizeToolArgs, summarizeToolResult } from "./tool-format.js";
 
 /** Renderer-ready copy derived from a tool call without owning its lifecycle. */
@@ -27,7 +29,7 @@ export interface ToolPresentationContext {
   /**
    * True when the tool dispatches a named subagent (each subagent exposes a
    * tool bearing its own name). The presentation reads as a delegation —
-   * `Delegate stock-price` — instead of a generic tool call.
+   * `Delegate subagent(stock price)` — instead of a generic tool call.
    */
   readonly isSubagent?: boolean;
   /** The tool's own `label.start` copy, used when eve has no copy of its own for the tool. */
@@ -63,7 +65,7 @@ interface BuiltinToolCopy {
 /** Copy shared by the full presenters and their preparing placeholders. */
 const WRITE_FILE_VERB = "Write";
 const DELEGATE_VERB = "Delegate";
-const FINAL_OUTPUT_TITLE = "Return final output";
+const REPLY_TITLE = "Reply";
 
 /**
  * Builtin tools whose calls read as one verb plus one argument. Runs group
@@ -92,26 +94,6 @@ const BUILTIN_TOOL_COPY: Readonly<Record<string, BuiltinToolCopy>> = {
     singularNoun: "command",
     pluralNoun: "commands",
   },
-  connection_execute: {
-    verb: "Call",
-    pastVerb: "Called",
-    argKey: "",
-    extractItem: (input) => {
-      const connection = salientArg(input, "connection");
-      const tool = salientArg(input, "tool");
-      return connection === undefined || tool === undefined ? undefined : `${connection}.${tool}`;
-    },
-    singularNoun: "connection tool",
-    pluralNoun: "connection tools",
-  },
-  connection_search: {
-    verb: "Search",
-    pastVerb: "Searched",
-    argKey: "query",
-    extractItem: (input) => salientArg(input, "connection"),
-    singularNoun: "tool search",
-    pluralNoun: "tool searches",
-  },
   glob: {
     verb: "Glob",
     pastVerb: "Globbed",
@@ -125,13 +107,6 @@ const BUILTIN_TOOL_COPY: Readonly<Record<string, BuiltinToolCopy>> = {
     argKey: "pattern",
     singularNoun: "pattern",
     pluralNoun: "patterns",
-  },
-  load_skill: {
-    verb: "Load",
-    pastVerb: "Loaded",
-    argKey: "skill",
-    singularNoun: "skill",
-    pluralNoun: "skills",
   },
   read_file: {
     verb: "Read",
@@ -178,7 +153,7 @@ function presentWriteFileTool(
   const write = readWriteFileInput(toolName, input);
   if (write === undefined) {
     return {
-      title: toolName,
+      title: toolDisplayTitle(toolName),
       subtitle: summarizeToolArgs(input),
       summarizeResult: summarizeToolResult,
     };
@@ -244,10 +219,10 @@ export function presentTool(
       summarizeResult: () => undefined,
     };
   }
-  if (baseName === "final_output") {
+  if (baseName === REPLY_TOOL_NAME) {
     // Structured-output terminal signal: its input is the
     // structured result itself, kept behind the expanded `--tools full` view.
-    return { title: FINAL_OUTPUT_TITLE, subtitle: "", summarizeResult: () => undefined };
+    return { title: REPLY_TITLE, subtitle: "", summarizeResult: () => undefined };
   }
 
   const copy = BUILTIN_TOOL_COPY[baseName];
@@ -285,10 +260,18 @@ export function presentTool(
   }
 
   return {
-    title: toolName,
+    title: toolDisplayTitle(toolName),
     subtitle: summarizeToolArgs(input),
     summarizeResult: summarizeToolResult,
   };
+}
+
+/**
+ * A person's name for a tool with no copy of its own: `linear__list_issues` →
+ * `List issues`.
+ */
+export function toolDisplayTitle(toolName: string): string {
+  return displayTitle(toolBaseName(toolName));
 }
 
 /**
@@ -312,18 +295,24 @@ export function isSelfModificationAgent(toolName: string): boolean {
   return toolBaseName(toolName) === SELF_MODIFICATION_AGENT_NAME;
 }
 
-/** The name an agent task goes by in the delegate row, task line, and task panel. */
+/**
+ * The name an agent task goes by in the delegate row, task line, and task
+ * panel, from its {@link agentDisplayName} and any `:N` ordinal.
+ */
 export function agentTaskLabel(name: string): string {
-  const readable = name
-    .replace(/^self-modification__agent(?=:\d+$|$)/u, "agent editor")
-    .replace(/__agent(?=:\d+$|$)/u, "");
-  return /^subagent(?::\d+)?$/u.test(readable) || readable.startsWith("agent editor")
-    ? readable
-    : `subagent(${readable})`;
+  return /^subagent(?::\d+)?$/u.test(name) || name.startsWith("agent editor")
+    ? name
+    : `subagent(${name})`;
 }
+
+/**
+ * A person's name for the agent a tool dispatches: `code__worker` →
+ * `worker`. An extension's own subagent compiles to `<extension>__agent`, so
+ * the extension names it.
+ */
 export function agentDisplayName(toolName: string): string {
   const baseName = toolBaseName(toolName);
-  return AGENT_DISPLAY_NAMES.get(baseName) ?? baseName;
+  return AGENT_DISPLAY_NAMES.get(baseName) ?? displayName(baseName.replace(/(?<=.)__agent$/u, ""));
 }
 
 /**
@@ -337,8 +326,8 @@ export function presentPreparingTool(
   context?: ToolPresentationContext,
 ): ToolPresentation {
   const baseName = toolBaseName(toolName);
-  if (baseName === "final_output") {
-    return { title: FINAL_OUTPUT_TITLE, subtitle: "", summarizeResult: () => undefined };
+  if (baseName === REPLY_TOOL_NAME) {
+    return { title: REPLY_TITLE, subtitle: "", summarizeResult: () => undefined };
   }
   if (context?.isSubagent === true) {
     // A named subagent's tool carries the delegation target in its name —
@@ -351,7 +340,7 @@ export function presentPreparingTool(
   }
   const verb = baseName === "write_file" ? WRITE_FILE_VERB : BUILTIN_TOOL_COPY[baseName]?.verb;
   return {
-    title: `${verb ?? toolName} …`,
+    title: `${verb ?? toolDisplayTitle(toolName)} …`,
     subtitle: "",
     summarizeResult: () => undefined,
   };

@@ -79,7 +79,7 @@ const model = mockModel((request) => {
   if (message.includes("Use workflow exactly once")) {
     // The workflow tool runs as a task: after its receipt, wait on it.
     if (request.toolResults.some((entry) => entry.name === "workflow")) {
-      return { toolCalls: [{ name: "task_wait", input: {} }] };
+      return { toolCalls: [{ name: "eve__task_wait", input: {} }] };
     }
     const localOnly = message.includes("local-sleeper only");
     return {
@@ -289,8 +289,11 @@ describe("turn cancellation descendant cascade", () => {
           message:
             "Use workflow exactly once to call local-sleeper only with message Use wait-for-cancel.",
         });
+        // The limit prompt holds the root turn, so its stream pauses at
+        // `turn.waiting` rather than settling the session.
         const events = await readThroughBoundary({
           iterator: response[Symbol.asyncIterator](),
+          isBoundary: (event) => event.type === "turn.waiting",
           label: "root session-limit prompt",
         });
         // The workflow program runs as a task, so the root reaches its limit
@@ -301,7 +304,9 @@ describe("turn cancellation descendant cascade", () => {
         );
         expect(tasks).toHaveLength(1);
         expect(requests).toHaveLength(1);
-        expect(requests[0]?.requestId.startsWith(`${response.sessionId}:limit:`)).toBe(true);
+        expect(requests[0]?.requestId).toMatch(
+          new RegExp(`^${response.sessionId}:\\d+:limit:`, "u"),
+        );
 
         const requestId = requests[0]?.requestId;
         if (requestId === undefined) throw new Error("Root limit prompt has no request id.");
@@ -380,8 +385,10 @@ async function readUntil(input: {
 
 async function readThroughBoundary(input: {
   readonly iterator: AsyncIterator<MessageStreamEvent>;
+  readonly isBoundary?: (event: MessageStreamEvent) => boolean;
   readonly label: string;
 }): Promise<readonly MessageStreamEvent[]> {
+  const isBoundary = input.isBoundary ?? isCurrentTurnBoundaryEvent;
   const events: MessageStreamEvent[] = [];
   await withinEventDeadline(
     (async () => {
@@ -389,7 +396,7 @@ async function readThroughBoundary(input: {
         const next = await input.iterator.next();
         if (next.done) throw new Error(`Stream ended before ${input.label}.`);
         events.push(next.value);
-        if (isCurrentTurnBoundaryEvent(next.value)) return;
+        if (isBoundary(next.value)) return;
       }
     })(),
     input.label,

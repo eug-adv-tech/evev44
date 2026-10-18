@@ -6,7 +6,10 @@ import { extensionOverridePaths } from "#compiler/extension-mount-bindings.js";
 import type { CompiledAgentManifest } from "#compiler/manifest.js";
 import { createCompiledModuleMapSource } from "#compiler/module-map.js";
 import { createAuthoredAssetImportPlugin } from "#internal/authored-asset-import-plugin.js";
-import { createExtensionMountPlugin } from "#internal/bundler/extension-mount-plugin.js";
+import {
+  createExtensionMountPlugin,
+  EXTENSION_CHUNK_DIRECTORY,
+} from "#internal/bundler/extension-mount-plugin.js";
 import { authoredModuleConditions } from "#internal/authored-module-conditions.js";
 import { createAuthoredModuleBundleError } from "#internal/authored-module-bundle.js";
 import { createAuthoredModuleEvaluationError } from "#internal/authored-module-evaluation-error.js";
@@ -57,6 +60,11 @@ export interface ExtensionMountEntry {
 }
 
 export interface AuthoredModuleLoadOptions {
+  /**
+   * Selected app root that owns authored Workflow ids. A workspace member's app root sits
+   * below the shared package root, which still owns dependency resolution.
+   */
+  readonly appRoot?: string;
   readonly externalDependencies?: readonly string[];
   readonly extension?: {
     readonly mountId: string;
@@ -193,7 +201,7 @@ export async function bundleAuthoredModuleCode(
               },
             },
           ]),
-      createAuthoredWorkflowDirectivePlugin({ appRoot: packageRoot }),
+      createAuthoredWorkflowDirectivePlugin({ appRoot: options.appRoot ?? packageRoot }),
       ...(mount === undefined ? [] : [createExtensionMountPlugin(mountChain)!]),
     ],
     sourcemap: "inline",
@@ -270,7 +278,7 @@ export async function bundleExtensionDistributionGraph(input: {
       tsconfig: resolveAuthoredTsConfigPath(input.packageRoot),
       write: false,
       output: {
-        chunkFileNames: "_chunks/[name]-[hash].mjs",
+        chunkFileNames: `${EXTENSION_CHUNK_DIRECTORY}/[name]-[hash].mjs`,
         codeSplitting: true,
         comments: false,
         entryFileNames: "[name].mjs",
@@ -301,6 +309,8 @@ export async function bundleExtensionDistributionGraph(input: {
 export interface AuthoredModuleMapBundle {
   readonly authoredWorkflowModules: AuthoredWorkflowModules;
   readonly code: string;
+  /** Application modules in the graph, including shared workspace modules outside the app root. */
+  readonly sourceModules: readonly string[];
   /** Fingerprint of the sources that also feed the driver and step registry; a change rebuilds the host. */
   readonly workflowSourceFingerprint: string | undefined;
 }
@@ -395,6 +405,7 @@ export async function bundleAuthoredModuleMapForGeneration(input: {
     return {
       authoredWorkflowModules: workflowSources.modules(),
       code: removeRolldownModuleRegionComments(chunk.code),
+      sourceModules: workflowSources.sourceModules().filter((id) => id !== input.moduleMapPath),
       workflowSourceFingerprint: workflowSources.fingerprint(),
     };
   } catch (error) {
@@ -447,6 +458,10 @@ class AuthoredWorkflowSourceRecorder {
 
   workflowFunctions(id: string): ReadonlySet<string> | undefined {
     return this.#workflowFunctions.get(id);
+  }
+
+  sourceModules(): readonly string[] {
+    return [...this.#sources.keys()].sort();
   }
 
   graphPlugin(): Record<string, unknown> {
@@ -656,7 +671,7 @@ function createInFlightModuleLoadKey(
 ): string {
   const externalDependencies = normalizeExternalDependencies(options.externalDependencies);
 
-  return `${modulePath}\0${externalDependencies.join("\0")}\0${options.extension?.mountId ?? ""}\0${options.extension?.evaluationId ?? ""}`;
+  return `${modulePath}\0${externalDependencies.join("\0")}\0${options.extension?.mountId ?? ""}\0${options.extension?.evaluationId ?? ""}\0${options.appRoot ?? ""}`;
 }
 
 export function resolveAuthoredTsConfigPath(packageRoot: string): string | false {

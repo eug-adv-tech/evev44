@@ -1,21 +1,22 @@
+import { bindTurnCallerContext } from "#subagents/parent-notification.js";
+import type { HandleEventFn } from "#harness/types.js";
 import { bindDynamicConnections } from "#execution/dynamic-connections.js";
+import { recoverDynamicConnectionRehydration } from "#execution/dynamic-connection-recovery.js";
 import { deriveSessionTitle } from "#execution/eve-workflow-attributes.js";
 import { setEveAttributes } from "#runtime/attributes/emit.js";
 import { defaultDeliverResult } from "#channel/adapter.js";
 import { contextStorage } from "#context/container.js";
 import { runStep } from "#context/run-step.js";
-import {
-  drainDynamicInstructionUserMessages,
-  prepareDynamicInstructionPreamble,
-} from "#context/dynamic-instruction-lifecycle.js";
 import { refreshDynamicSessionSubagentsForRuntimeRevision } from "#context/dynamic-subagent-lifecycle.js";
-import { drainMemoryCommit, prepareMemoryPreamble } from "#context/memory-lifecycle.js";
 import {
   rebindMissingCompiledDynamicToolCallbacks,
   refreshDynamicSessionToolsForRuntimeRevision,
 } from "#context/dynamic-tool-lifecycle.js";
 import {
   AuthKey,
+  ScheduleIdKey,
+  ScheduleInstanceKey,
+  OccurrenceIdKey,
   InitiatorAuthKey,
   SessionTitleKey,
   ParentSessionKey,
@@ -29,27 +30,32 @@ import {
 } from "#context/keys.js";
 import { BundleKey, ChannelKey } from "#runtime/sessions/runtime-context-keys.js";
 import { deserializeContext, serializeContext } from "#context/serialize.js";
-import {
-  emitTurnPreamble,
-  getHarnessEmissionState,
-  isHarnessBetweenTurns,
-  setHarnessEmissionState,
-} from "#harness/emission.js";
 import { bindSessionInstrumentation } from "#instrumentation/runtime.js";
 import { RuntimeActionSettlementTimesKey } from "#harness/runtime-action-settlement-state.js";
-import * as agentTraceState from "#tracing/agent-trace-context-store.js";
+import * as agentTraceState from "#tracing/eve/agent-trace-context-store.js";
 import { matchAuthorizationCallbacks } from "#execution/authorization-callback-match.js";
 import { isTurnCancellation, throwIfTurnAborted } from "#harness/turn-cancellation.js";
 import { setChannelContext } from "#execution/channel-context.js";
-import { activeTurnId } from "#harness/active-turn-id.js";
 import {
-  coalesceTurnInputs,
-  createTurnInputMessages,
-  validateHarnessModelMessages,
-  type UserModelMessage,
-} from "#harness/messages.js";
-import { consumeDeferredStepInput } from "#harness/pending-input-batches.js";
+  activeTurnId,
+  isBetweenTurns,
+  storedProjection,
+  turnPosition,
+} from "#harness/session-machine/view.js";
+import {
+  currentProjection,
+  enterSessionProjection,
+  saveSessionProjection,
+} from "#harness/session-machine/current.js";
+import { saveTransition, dropClosedRecords, sessionView } from "#harness/session-machine/commit.js";
+import { matchSignIns } from "#harness/session-machine/transitions.js";
+import {
+  sessionStartedForResolvers,
+  turnStartedForResolvers,
+} from "#harness/session-machine/resolver-events.js";
+import { coalesceTurnInputs, validateHarnessModelMessages } from "#harness/messages.js";
 import type { HarnessSession, StepInput, StepResult } from "#harness/types.js";
+import { attributeAnswers } from "#execution/session/answer-caller.js";
 import type {
   DurableStepResult,
   TurnStepInput,
@@ -60,18 +66,8 @@ import { withSessionStateDelta } from "#execution/session/state-delta.js";
 import { openSessionEventPublisher } from "#execution/publish-session-events.js";
 import { createTurnEventHandler } from "#execution/session/turn-event-handler.js";
 import { derivePendingState } from "#execution/session/pending-turn-state.js";
-import {
-  createAuthorizationCompletedEvent,
-  createSessionStartedEvent,
-  createTurnStartedEvent,
-} from "#protocol/message.js";
-import { authorizationEventFields } from "#harness/authorization-event-fields.js";
-import {
-  CallbackBaseUrlKey,
-  clearPendingAuthorization,
-  getPendingAuthorization,
-  PendingAuthorizationResultKey,
-} from "#harness/authorization.js";
+import { CallbackBaseUrlKey, PendingAuthorizationResultKey } from "#harness/authorization.js";
+import { readHitlState } from "#harness/hitl/index.js";
 import { resolveWorkflowCallbackBaseUrl } from "#execution/workflow-callback-url.js";
 import { countRunUsage } from "#execution/agent-sessions/usage.js";
 import {
@@ -79,7 +75,6 @@ import {
   readDurableSession,
 } from "#execution/durable-session-store.js";
 import { buildRuntimeIdentity, createExecutionNodeStep } from "#execution/node-step.js";
-import { prepareWorkflowPreambleTrace } from "#execution/workflow-trace-context.js";
 import { resolveEffectiveAgentRuntime } from "#execution/effective-agent-config.js";
 import { reconcileSessionContinuationToken } from "#execution/reconcile-session-continuation-token.js";
 import { hydrateDurableSession, refreshSessionFromTurnAgent } from "#execution/session.js";
@@ -91,6 +86,7 @@ import {
   createCancelledModelCallBatchResult,
   type CompletedModelCallCheckpoint,
 } from "#execution/cancelled-model-call-batch.js";
+import type { AuthorizationChallenge } from "#harness/authorization.js";
 
 function channelDeliveryErrorCode(error: unknown): string {
   if (typeof error === "object" && error !== null && "code" in error) {
@@ -102,13 +98,34 @@ function channelDeliveryErrorCode(error: unknown): string {
 
 export type { TurnStepInput };
 
+interface PendingStepAttributes {
+  title?: Promise<void>;
+}
+
 /** Runs a bounded batch of harness model steps inside one durable `"use step"` boundary. */
 export async function turnStep(input: TurnStepInput): Promise<TurnStepResult> {
   "use step";
-  return await withSessionStateDelta(input, runSessionStep);
+  return await withSessionStateDelta(input, (state) =>
+    runSessionStep({
+      ...state,
+      serializedContext: bindTurnCallerContext(state.caller, state.serializedContext),
+    }),
+  );
 }
 
 async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> {
+  const pendingAttributes: PendingStepAttributes = {};
+  try {
+    return await runSessionStepBody(input, pendingAttributes);
+  } finally {
+    await pendingAttributes.title;
+  }
+}
+
+async function runSessionStepBody(
+  input: TurnStepInput,
+  pendingAttributes: PendingStepAttributes,
+): Promise<DurableStepResult> {
   // The delivery as accepted, before authorization callbacks are matched out of it.
   const rawDelivery = input.input?.delivery;
   let delivery = rawDelivery;
@@ -120,6 +137,7 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
     durableSession = countRunUsage(durableSession, usage);
   }
   const ctx = await deserializeContext(input.serializedContext);
+  enterSessionProjection(ctx, durableSession.state);
   const adapter = ctx.require(ChannelKey);
   const bundle = ctx.require(BundleKey);
   const effectiveAgent = resolveEffectiveAgentRuntime(bundle, ctx);
@@ -136,28 +154,41 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
     // Outside a workflow context (e.g. tests) — getHookUrl will return undefined.
   }
 
-  const pendingAuth = getPendingAuthorization(durableSession.state);
+  const { signIns } = readHitlState(durableSession.state);
   let completedAuths: ReturnType<typeof matchAuthorizationCallbacks>["matches"] | undefined;
-  if (pendingAuth && delivery !== undefined) {
-    const { matches, remainingPayloads } = matchAuthorizationCallbacks(
-      pendingAuth,
-      delivery.payloads,
-    );
+  if (signIns.length > 0 && delivery !== undefined) {
+    const { matches, remainingPayloads } = matchAuthorizationCallbacks(signIns, delivery.payloads);
     delivery = { ...delivery, payloads: remainingPayloads };
     if (matches.length > 0) {
       const matchedAttemptIds = matches.map((match) => match.result.attemptId);
       const authResults = matches.map((match) => match.result);
       ctx.set(PendingAuthorizationResultKey, authResults);
-      durableSession = {
-        ...durableSession,
-        state: clearPendingAuthorization(durableSession.state, matchedAttemptIds),
-      };
+      // The session stops waiting on them; the turn they resume reports their completion.
+      const view = sessionView(storedProjection(durableSession.state), durableSession.state);
+      const transition = matchSignIns(view, { attemptIds: matchedAttemptIds });
+      if (transition.events.length !== 0) throw new Error("matchSignIns must not emit events.");
+      durableSession = saveTransition(durableSession, transition);
       completedAuths = matches;
       if (remainingPayloads.length === 0) delivery = undefined;
     }
   }
 
+  // A new inbound message is a new caller action, not a scheduled occurrence.
+  // Approval/input responses alone keep the parked turn's provenance.
+  if (delivery?.payloads.some((payload) => payload.message !== undefined)) {
+    ctx.delete(ScheduleIdKey);
+    ctx.delete(ScheduleInstanceKey);
+    ctx.delete(OccurrenceIdKey);
+    if (delivery.schedule !== undefined) {
+      ctx.set(ScheduleIdKey, delivery.schedule.definition);
+      if (delivery.schedule.instance !== undefined)
+        ctx.set(ScheduleInstanceKey, delivery.schedule.instance);
+      if (delivery.schedule.occurrenceId !== undefined)
+        ctx.set(OccurrenceIdKey, delivery.schedule.occurrenceId);
+    }
+  }
   const previousAuth = ctx.get(AuthKey);
+  const hadInitiator = ctx.has(InitiatorAuthKey);
 
   // Apply deliver-time auth ferried via `resumeHook` (initial-turn
   // input has no auth; it was seeded by buildRunContext).
@@ -191,7 +222,8 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
     rootSessionId: initialSession.rootSessionId ?? initialSession.sessionId,
     sessionId: initialSession.sessionId,
   });
-  const initialEmissionState = getHarnessEmissionState(initialSession.state);
+  const initialEmissionState = turnPosition(currentProjection(ctx));
+  const startedBetweenTurns = isBetweenTurns(currentProjection(ctx));
   if (
     !initialEmissionState.sessionStarted &&
     !ctx.has(SessionTitleKey) &&
@@ -201,7 +233,7 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
     const title = deriveSessionTitle(rawDelivery?.title ?? message);
     if (title !== undefined) {
       ctx.set(SessionTitleKey, title);
-      await setEveAttributes({ "$eve.title": title });
+      pendingAttributes.title = setEveAttributes({ "$eve.title": title });
     }
   }
 
@@ -256,7 +288,8 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
   try {
     const dynamicConnections = bindDynamicConnections(ctx, bundle.resolvedAgent);
     const effectiveNode = { ...bundle.graph.root, turnAgent: effectiveAgent.turnAgent };
-    const handleEvent = createTurnEventHandler({
+    let compacted = false;
+    const emitTurnEvent = createTurnEventHandler({
       abortSignal,
       bundle,
       canCancelTurn: input.input?.control === undefined,
@@ -268,8 +301,12 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
       instrumentation,
       publisher,
     });
+    const handleEvent: HandleEventFn = async (event, messages) => {
+      if (event.type === "compaction.completed") compacted = true;
+      await emitTurnEvent(event, messages);
+    };
     const previousAdapterState =
-      delivery !== undefined && !isHarnessBetweenTurns(initialSession)
+      delivery !== undefined && !startedBetweenTurns
         ? structuredClone(adapterCtx.state)
         : undefined;
     // Run the adapter's deliver hook for each queued payload and coalesce
@@ -293,8 +330,27 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
       }
       resolved = results.length === 0 ? undefined : results.reduce(coalesceTurnInputs);
     }
+    // A delivery without auth acts as the session's current identity, so
+    // only a delivery that names its sender can be answered by someone else.
+    const answers =
+      delivery?.auth === undefined
+        ? undefined
+        : attributeAnswers({
+            responder: delivery.auth,
+            state: durableSession.state,
+            stepInput: resolved,
+          });
+    if (answers !== undefined) {
+      // The responder settles the request; the turn keeps its caller and
+      // initiator. Adapter state from the answer stays: channels record the
+      // responder and their prompt cards there, not the reply destination.
+      resolved = answers;
+      if (previousAuth === undefined) ctx.delete(AuthKey);
+      else ctx.set(AuthKey, previousAuth);
+      if (!hadInitiator) ctx.delete(InitiatorAuthKey);
+    }
     const ignoredActiveDelivery =
-      delivery !== undefined && resolved === undefined && !isHarnessBetweenTurns(initialSession);
+      delivery !== undefined && resolved === undefined && !startedBetweenTurns;
     if (ignoredActiveDelivery) {
       // The adapter sees the incoming caller, but an ignored correction must
       // not change the identity or reply destination of the interrupted work.
@@ -317,7 +373,6 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
         ctx.set(TurnDeliveryIdsKey, [ctx.require(ChannelDeliveryKey).deliveryId]);
       }
     }
-
     if (runtimeResults !== undefined) {
       if (runtimeResults.acceptedAtMsByCallId !== undefined) {
         ctx.set(RuntimeActionSettlementTimesKey, runtimeResults.acceptedAtMsByCallId);
@@ -330,7 +385,7 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
       setChannelContext(ctx, updatedAdapter);
     }
 
-    if (delivery !== undefined && resolved === undefined && isHarnessBetweenTurns(initialSession)) {
+    if (delivery !== undefined && resolved === undefined && startedBetweenTurns) {
       await contextStorage.run(ctx, () =>
         instrumentation?.instrumentChannelDelivery({
           ctx,
@@ -339,7 +394,10 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
         }),
       );
       await instrumentation?.flush();
-      const aliased = reconcileSessionContinuationToken(ctx, initialSession);
+      const aliased = saveSessionProjection(
+        reconcileSessionContinuationToken(ctx, initialSession),
+        ctx,
+      );
       const nextSerializedContext = serializeContext(ctx);
       const nextValues =
         aliased === initialSession
@@ -348,7 +406,7 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
 
       return {
         action: "park",
-        ...derivePendingState(aliased),
+        ...derivePendingState(aliased, currentProjection(ctx)),
         serializedContext: nextSerializedContext,
         ...nextValues,
       };
@@ -369,7 +427,7 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
         ctx.set(SessionDynamicSubagentRuntimeRevisionKey, dynamicRuntimeRevision);
         ctx.set(SessionDynamicToolRuntimeRevisionKey, dynamicRuntimeRevision);
       } else {
-        const refreshEvent = createSessionStartedEvent({ runtime: runtimeIdentity });
+        const refreshEvent = sessionStartedForResolvers(runtimeIdentity);
         await Promise.all([
           refreshDynamicSessionSubagentsForRuntimeRevision({
             ctx,
@@ -390,10 +448,10 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
               }),
           ),
         ]);
-        if (!isHarnessBetweenTurns(initialSession)) {
+        if (!startedBetweenTurns) {
           await rebindMissingCompiledDynamicToolCallbacks({
             ctx,
-            event: createTurnStartedEvent({
+            event: turnStartedForResolvers({
               sequence: initialEmissionState.sequence,
               turnId: activeTurnId(initialEmissionState),
             }),
@@ -414,6 +472,7 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
     const runHarnessStep = async (
       lifecycleSession: HarnessSession,
       stepInput: StepInput | undefined,
+      signInCompletions: readonly AuthorizationChallenge[] | undefined,
     ): Promise<StepResult> => {
       const refreshedSession = refreshSessionFromTurnAgent({
         compactionOverrides: {
@@ -432,7 +491,8 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
         compactOnly: input.input?.control === "compact",
         createRuntime: createWorkflowRuntime,
         handleEvent,
-        prepareApprovalTurn: (event) => dynamicConnections.dispatch(createTurnStartedEvent(event)),
+        prepareApprovalTurn: (event) => dynamicConnections.dispatch(turnStartedForResolvers(event)),
+        signInCompletions,
         historyProjector: history.projector,
         historyView: history.prepare(modelSession),
         instrumentation,
@@ -441,6 +501,7 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
           nodeId: bundle.nodeId,
         },
         node: effectiveNode,
+        titleAttributeWrite: pendingAttributes.title,
       });
       return step(modelSession, stepInput);
     };
@@ -465,82 +526,39 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
               firstCall && resolved?.outputSchema !== undefined
                 ? { ...enrichedSession, outputSchema: resolved.outputSchema }
                 : enrichedSession;
-            const connectionState = getHarnessEmissionState(schemaSession.state);
-            await dynamicConnections.rehydrate(
-              connectionState,
-              runtimeIdentity,
-              isHarnessBetweenTurns(schemaSession)
-                ? undefined
-                : { sequence: connectionState.sequence, turnId: activeTurnId(connectionState) },
-            );
-            if (firstCall && completedAuths) {
-              let emissionState = getHarnessEmissionState(schemaSession.state);
-              const startsTurn = completedAuths.some(
-                ({ challenge }) => challenge.candidateId === undefined,
+            const connectionState = turnPosition(currentProjection(ctx));
+            try {
+              await dynamicConnections.rehydrate(
+                connectionState,
+                runtimeIdentity,
+                isBetweenTurns(currentProjection(ctx))
+                  ? undefined
+                  : { sequence: connectionState.sequence, turnId: activeTurnId(connectionState) },
               );
-              if (startsTurn && isHarnessBetweenTurns(schemaSession)) {
-                const turnInput = createTurnInputMessages(
-                  consumeDeferredStepInput({ session: schemaSession, input: stepInput }).input,
-                );
-                prepareDynamicInstructionPreamble(ctx, history.messages(schemaSession));
-                prepareMemoryPreamble(ctx, {
-                  history: schemaSession.history,
-                  input: turnInput,
-                  projector: history.projector,
-                  state: schemaSession.state,
-                });
-                let instructionMessages: readonly UserModelMessage[] = [];
-                const traceContext = await prepareWorkflowPreambleTrace({
-                  emissionState,
-                  instrumentation,
-                });
-                try {
-                  emissionState = await emitTurnPreamble(
-                    handleEvent,
-                    {},
-                    emissionState,
-                    history.projector({
-                      messages: [...schemaSession.history, ...turnInput],
-                      state: schemaSession.state,
-                    }),
-                    runtimeIdentity,
-                    traceContext,
-                  );
-                } finally {
-                  instructionMessages = drainDynamicInstructionUserMessages(ctx);
-                  const memoryCommit = drainMemoryCommit(ctx);
-                  schemaSession = {
-                    ...schemaSession,
-                    history: validateHarnessModelMessages([
-                      ...schemaSession.history,
-                      ...(memoryCommit?.recalledMessages ?? []),
-                      ...instructionMessages,
-                    ]),
-                    state: memoryCommit?.state ?? schemaSession.state,
-                  };
-                }
-                schemaSession = setHarnessEmissionState(schemaSession, emissionState);
-              }
-              for (const { challenge } of completedAuths) {
-                await handleEvent(
-                  createAuthorizationCompletedEvent({
-                    ...authorizationEventFields(challenge),
-                    outcome: "authorized",
-                    sequence: emissionState.sequence,
-                    stepIndex: emissionState.stepIndex,
-                    turnId: emissionState.turnId,
-                  }),
-                );
-              }
+            } catch (error) {
+              const recovered = await recoverDynamicConnectionRehydration({
+                emit: handleEvent,
+                error,
+                projection: currentProjection(ctx),
+                session: schemaSession,
+              });
+              if (recovered !== undefined) return recovered;
+              throw error;
             }
-
-            return runHarnessStep(schemaSession, stepInput);
+            // A sign-in completes before the turn it resumes, in the first call only.
+            const completions =
+              firstCall && completedAuths !== undefined
+                ? completedAuths.map(({ challenge }) => challenge)
+                : undefined;
+            return runHarnessStep(schemaSession, stepInput, completions);
           });
           // The waiting boundary may reach the client before this step returns.
           // Its settled result wins over a cancellation of that completed turn.
           if (result.settledTurn === undefined) throwIfTurnAborted(abortSignal);
-          completedModelCall = { result, serializedContext: serializeContext(ctx) };
-          return result;
+          // The call's result carries the lifecycle it published, which batching reads.
+          const saved = { ...result, session: saveSessionProjection(result.session, ctx) };
+          completedModelCall = { result: saved, serializedContext: serializeContext(ctx) };
+          return saved;
         },
       });
     } catch (error) {
@@ -558,14 +576,20 @@ async function runSessionStep(input: TurnStepInput): Promise<DurableStepResult> 
     }
 
     // Re-stamp the current address after handlers add a continuation alias.
-    const aliased = reconcileSessionContinuationToken(ctx, stepResult.session);
+    const aliased = saveSessionProjection(
+      dropClosedRecords(
+        reconcileSessionContinuationToken(ctx, stepResult.session),
+        currentProjection(ctx),
+      ),
+      ctx,
+    );
     agentTraceState.pruneAgentTraceState(ctx, aliased.sessionId, aliased.state);
     const nextSerializedContext = serializeContext(ctx);
     stepResult = { ...stepResult, session: aliased };
 
     const durableResult = resolveSessionStepResult(stepResult, nextSerializedContext);
     if (durableResult.action === "done") await publisher.writer.close();
-    return durableResult;
+    return compacted ? { ...durableResult, compacted: true } : durableResult;
   } finally {
     publisher.writer.release();
   }

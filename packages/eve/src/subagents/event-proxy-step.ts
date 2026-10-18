@@ -3,7 +3,6 @@ import type {
   SubagentInputRequestHookPayload,
 } from "#channel/types.js";
 import {
-  publishFromSessionStep,
   restoreSessionStep,
   type PublishedSessionEvents,
   type RestoredSessionStep,
@@ -13,9 +12,10 @@ import {
   withSessionStateDelta,
   type SessionStateTransition,
 } from "#execution/session/state-delta.js";
-import { emitProxiedAuthorizationEvent, emitProxiedInputRequest } from "#subagents/hitl-proxy.js";
-import { upsertProxyInputRequests } from "#harness/proxy-input-requests.js";
-import type { WorkflowAskRoute } from "#harness/proxy-input-requests.js";
+import { commitSessionStep } from "#execution/publish-session-events.js";
+import { readHitlState } from "#harness/hitl/index.js";
+import type { WorkflowAskRoute } from "#harness/hitl/relays.js";
+import { relay } from "#harness/session-machine/transitions.js";
 
 type SubagentEventHookPayload =
   | SubagentAuthorizationEventHookPayload
@@ -54,39 +54,35 @@ export async function emitProxiedSubagentEvent(
   },
 ): Promise<PublishedSessionEvents> {
   const { hookPayload, runId, workflowAsk } = input;
-  const { published } = await publishFromSessionStep(input, {
-    origin: "relayed",
-    inputSource:
-      hookPayload.kind === "subagent-input-request"
-        ? JSON.stringify([hookPayload.childContinuationToken, hookPayload.inputSource ?? null])
-        : undefined,
-    async publish(emit, session) {
-      if (hookPayload.kind === "subagent-authorization-event") {
-        await emitProxiedAuthorizationEvent({ emit, hookPayload, session });
-        return undefined;
-      }
-      return await emitProxiedInputRequest({ emit, hookPayload, session });
+  // A child's fresh batch replaces its prior one, whose routes stop working, so readers
+  // must stop offering what it held.
+  const incoming = new Set(
+    hookPayload.kind === "subagent-input-request"
+      ? hookPayload.event.requests.map((request) => request.requestId)
+      : [],
+  );
+  const replaced =
+    hookPayload.kind !== "subagent-input-request"
+      ? []
+      : [...readHitlState(input.durableSession.state).relays]
+          .filter(
+            ([requestId, route]) =>
+              route.childContinuationToken === hookPayload.childContinuationToken &&
+              route.inputSource === hookPayload.inputSource &&
+              !incoming.has(requestId),
+          )
+          .map(([requestId]) => requestId);
+  return await commitSessionStep(
+    input,
+    (view) => [
+      relay(view, { payload: hookPayload, replacedRequestIds: replaced, runId, workflowAsk }),
+    ],
+    {
+      origin: "relayed",
+      inputSource:
+        hookPayload.kind === "subagent-input-request"
+          ? JSON.stringify([hookPayload.childContinuationToken, hookPayload.inputSource ?? null])
+          : undefined,
     },
-    updateSession(session, entries) {
-      if (entries === undefined || hookPayload.kind !== "subagent-input-request") {
-        return { session };
-      }
-      return {
-        session: upsertProxyInputRequests({
-          entries: entries.map(([requestId, route]) => [
-            requestId,
-            {
-              ...route,
-              ...(workflowAsk !== undefined && { workflowAsk }),
-              ...(runId !== undefined && { runId }),
-            },
-          ]),
-          forChildContinuationToken: hookPayload.childContinuationToken,
-          inputSource: hookPayload.inputSource,
-          session,
-        }),
-      };
-    },
-  });
-  return published;
+  );
 }

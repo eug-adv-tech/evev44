@@ -15,6 +15,10 @@ import {
   type SlackInputRequestPostPart,
 } from "#public/channels/slack/hitl.js";
 import {
+  answeredBlocksFromActionBlock,
+  type SettledCard,
+} from "#public/channels/slack/interaction-cards.js";
+import {
   SLACK_MAX_BLOCKS_PER_MESSAGE,
   truncateMessageText,
 } from "#public/channels/slack/limits.js";
@@ -134,7 +138,7 @@ function recordApprovalCards(
 async function settleApprovalCard(
   channel: SlackEventContext,
   requestId: string,
-  answer: { readonly announcement: string; readonly label: string; readonly userId?: string },
+  answer: SettledCard & { readonly announcement: string },
 ): Promise<void> {
   const cards = channel.state.pendingApprovalCards ?? {};
   const card = cards[requestId];
@@ -145,23 +149,17 @@ async function settleApprovalCard(
   const messageChannelId = card.messageChannelId ?? channel.state.channelId;
   if (messageChannelId === null) return;
 
+  // Grouped messages can already hold Slack's 50-block maximum, so a retired
+  // card must stay one block or every later update is rejected.
   const blocks = card.messageBlocks.flatMap((block) => {
     if (!blockContainsRequestAction(block, requestId)) return [block];
-    if (typeof block !== "object" || block === null) return [];
-    const candidate = block as Record<string, unknown>;
-    if (candidate.type !== "card") {
-      return buildAnsweredBlocks({
+    return (
+      answeredBlocksFromActionBlock({
         answerLabel: answer.label,
-        promptBlocks: [],
+        block,
         userId: answer.userId,
-      });
-    }
-    const { actions: _actions, subtext: _subtext, ...withoutActions } = candidate;
-    return buildAnsweredBlocks({
-      answerLabel: answer.label,
-      promptBlocks: [withoutActions],
-      userId: answer.userId,
-    });
+      }) ?? buildAnsweredBlocks({ answerLabel: answer.label, promptBlocks: [] })
+    );
   });
   for (const [otherId, pendingCard] of Object.entries(next)) {
     if (pendingCard.messageTs === card.messageTs) {
@@ -171,7 +169,7 @@ async function settleApprovalCard(
   await settleRequest(channel, "chat.update", requestId, {
     blocks,
     channel: messageChannelId,
-    text: `Answered: ${answer.label}`,
+    text: answer.text,
     ts: card.messageTs,
   });
 
@@ -294,9 +292,11 @@ export const approvalEvents: Pick<
     const approved = event.outcome === "approved";
     const userId = slackUserIdForPrincipal(channel.state, event.responderPrincipalId);
     const by = userId === undefined ? "" : ` by <@${userId}>`;
+    const label = approved ? "Approve" : "Cancel";
     await settleApprovalCard(channel, event.requestId, {
       announcement: `${approved ? "Approved" : "Cancelled"}${by}.`,
-      label: approved ? "Approve" : "Cancel",
+      label,
+      text: `Answered: ${label}`,
       userId,
     });
   },
@@ -313,12 +313,13 @@ export const approvalEvents: Pick<
           : resolution.outcome === "denied"
             ? "Cancel"
             : "No longer needed";
+      const withdrawn = label === "No longer needed";
       await settleApprovalCard(channel, resolution.requestId, {
-        announcement:
-          label === "No longer needed"
-            ? "This approval is no longer needed."
-            : `${label === "Approve" ? "Approved" : "Cancelled"}.`,
+        announcement: withdrawn
+          ? "This approval is no longer needed."
+          : `${label === "Approve" ? "Approved" : "Cancelled"}.`,
         label,
+        text: withdrawn ? label : `Answered: ${label}`,
       });
     }
   },

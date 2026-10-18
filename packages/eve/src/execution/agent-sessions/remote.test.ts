@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { FatalError } from "#compiled/@workflow/core/index.js";
 import type { SessionAuthContext } from "#channel/types.js";
 import { readForwardedParentSessionBaggage } from "#protocol/baggage.js";
+import { REMOTE_AGENT_PROTOCOL_VERSION } from "#protocol/remote-agent-protocol.js";
 import {
   cancelRemoteAgentTurn,
   continueRemoteAgentSession,
@@ -164,6 +166,64 @@ describe("resolveRemoteAgentStreamHeaders", () => {
 });
 
 describe("startRemoteAgentSession", () => {
+  it("uses the library transport handoff for a worker dispatch", async () => {
+    const { AsyncLocalStorageContextManager } = await import("@opentelemetry/context-async-hooks");
+    const { context } = await import("@opentelemetry/api");
+    const { agentDelegation } = await import("#tracing/eve/delegation.js");
+    const manager = new AsyncLocalStorageContextManager().enable();
+    context.setGlobalContextManager(manager);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        Response.json(
+          { ok: true, protocolVersion: 2, sessionId: "remote-session", status: "accepted" },
+          { status: 202 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await agentDelegation.resume(
+        {
+          context: {
+            trace: {
+              conversationId: "conversation",
+              originAudience: "public",
+              parentTraceContext: {
+                traceId: "a".repeat(32),
+                spanId: "b".repeat(16),
+                traceFlags: 1,
+                decision: { action: "record", recordInputs: false, recordOutputs: false },
+              },
+            },
+            parent: {
+              sessionId: "parent",
+              rootSessionId: "parent",
+              callId: "call",
+              turn: { id: "turn", sequence: 0 },
+            },
+          },
+          agentName: "research",
+        },
+        () =>
+          startRemoteAgentSession({
+            action: createAction(),
+            callbackBaseUrl: "https://caller.example.com",
+            remote: createRemoteAgent(),
+            session: { continuationToken: "eve:parent-token" },
+          }),
+      );
+      const options = fetchMock.mock.calls[0]?.[1];
+      expect(JSON.parse(new Headers(options.headers).get("x-agent-tracing")!)).toMatchObject({
+        conversationId: "conversation",
+        parentRunId: "parent",
+        parentCallId: "call",
+      });
+      expect(options.redirect).toBe("error");
+    } finally {
+      context.disable();
+      manager.disable();
+    }
+  });
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -191,6 +251,26 @@ describe("startRemoteAgentSession", () => {
     expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toMatchObject({
       operationId: "operation-1",
     });
+  });
+
+  it("accepts an unversioned (protocol 1) remote's create response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          Response.json({ ok: true, sessionId: "legacy-session", status: "accepted" }),
+        ),
+    );
+
+    await expect(
+      startRemoteAgentSession({
+        action: createAction(),
+        callbackBaseUrl: "https://caller.example.com",
+        remote: createRemoteAgent(),
+        session: { continuationToken: "eve:parent-token" },
+      }),
+    ).resolves.toEqual({ sessionId: "legacy-session" });
   });
 
   it.each([true, false])(
@@ -331,38 +411,74 @@ describe("startRemoteAgentSession", () => {
     });
   });
 
-  it("rejects the former create-session response shape", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(
-        new Response(JSON.stringify({ ok: true, sessionId: "remote-session" }), { status: 202 }),
-      );
+  it.each([
+    ["the former response shape", () => Response.json({ ok: true, sessionId: "remote-session" })],
+    ["a missing session ID", () => Response.json({ ok: true })],
+    ["non-JSON", () => new Response("accepted")],
+  ])("stops replay and reports an unknown outcome after accepting %s", async (_label, response) => {
+    const fetchMock = vi.fn().mockResolvedValue(response());
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(
-      startRemoteAgentSession({
-        action: createAction(),
-        callbackBaseUrl: "https://caller.example.com",
-        remote: createRemoteAgent(),
-        session: { continuationToken: "eve:parent-token" },
-      }),
-    ).rejects.toThrow("create-session response was invalid");
+    const result = startRemoteAgentSession({
+      action: createAction(),
+      callbackBaseUrl: "https://caller.example.com",
+      remote: createRemoteAgent(),
+      session: { continuationToken: "eve:parent-token" },
+    });
+    await expect(result).rejects.toBeInstanceOf(FatalError);
+    await expect(result).rejects.toThrow("may have completed");
+    await expect(result).rejects.toThrow("Do not retry automatically");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects a create-session response without any sessionId", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 202 }));
+  it("reports work accepted under an unknown protocol as potentially completed", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json(
+        {
+          ok: true,
+          protocolVersion: REMOTE_AGENT_PROTOCOL_VERSION + 1,
+          sessionId: "remote-session",
+          status: "accepted",
+        },
+        { status: 202 },
+      ),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(
-      startRemoteAgentSession({
-        action: createAction(),
-        callbackBaseUrl: "https://caller.example.com",
-        remote: createRemoteAgent(),
-        session: { continuationToken: "eve:parent-token" },
-      }),
-    ).rejects.toThrow("create-session response was invalid");
+    const result = startRemoteAgentSession({
+      action: createAction(),
+      callbackBaseUrl: "https://caller.example.com",
+      remote: createRemoteAgent(),
+      session: { continuationToken: "eve:parent-token" },
+    });
+    await expect(result).rejects.toBeInstanceOf(FatalError);
+    await expect(result).rejects.toThrow("may have completed");
+    await expect(result).rejects.toThrow("Remote session: remote-session");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a receiver's protocol rejection distinct from accepted work", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json(
+          {
+            code: "REMOTE_AGENT_PROTOCOL_MISMATCH",
+            protocolVersion: 3,
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    const result = startRemoteAgentSession({
+      action: createAction(),
+      callbackBaseUrl: "https://caller.example.com",
+      remote: createRemoteAgent(),
+      session: { continuationToken: "eve:parent-token" },
+    });
+    await expect(result).rejects.toBeInstanceOf(FatalError);
+    await expect(result).rejects.toThrow("protocol 3");
+    await expect(result).rejects.not.toThrow("may have completed");
   });
 
   it("preserves a prefixed remote base path on create-session requests", async () => {

@@ -1,5 +1,6 @@
 import { parseNdjsonStream } from "#execution/ndjson-stream.js";
-import { getRun } from "#internal/workflow/runtime.js";
+import { RunExpiredError } from "#compiled/@workflow/errors/index.js";
+import { getRun, getWorld } from "#internal/workflow/runtime.js";
 import type { MessageStreamEvent } from "#protocol/message.js";
 import {
   normalizePersistedMessageStreamEvent,
@@ -38,12 +39,48 @@ export function readSessionEventStream(
   );
 }
 
+/**
+ * Reads one session's recorded events up to the durable tail observed when
+ * the read opens, then ends. Negative `startIndex` values count back from
+ * that tail.
+ */
+export function readSessionEventHistory(
+  sessionId: string,
+  startIndex?: number,
+): ReadableStream<MessageStreamEvent> {
+  const events = streamSessionEvents(sessionId, { follow: false, startIndex });
+  return new ReadableStream<MessageStreamEvent>({
+    async pull(controller) {
+      const next = await events.next();
+      if (next.done) controller.close();
+      else controller.enqueue(next.value);
+    },
+    async cancel() {
+      await events.return(undefined);
+    },
+  });
+}
+
 /** Returns the index of the last durably recorded event, or `-1` before the first. */
 export async function readSessionStreamTailIndex(sessionId: string): Promise<number> {
   // The readable is never consumed; cancel it so the unread source does not linger.
   const readable = getRun(sessionId).getReadable();
   try {
-    return await readable.getTailIndex();
+    const world = await getWorld();
+    const [run, tailIndex] = await Promise.all([
+      world.runs.get(sessionId, { resolveData: "none" }),
+      readable.getTailIndex(),
+    ]);
+    // Purging can leave chunk records behind; their count does not imply readable data.
+    if (run.expiredAt !== undefined && run.expiredAt.getTime() <= Date.now()) {
+      throw new RunExpiredError(
+        "Session history is no longer available.",
+        sessionId,
+        run.status,
+        run.expiredAt,
+      );
+    }
+    return tailIndex;
   } finally {
     await readable.cancel().catch(() => {});
   }

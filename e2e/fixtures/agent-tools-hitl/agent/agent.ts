@@ -3,13 +3,14 @@ import { defineAgent, defineDynamic } from "eve";
 import type { MockModelRequest, MockModelResponse } from "eve/evals";
 
 import { continuationModel } from "./lib/continuation/model.ts";
+import { humanInputModel } from "./lib/hitl/model.ts";
 
 const AUTH_PROBE_DIRECTIVE = /call the auth-probe tool exactly once with marker "([^"]+)"/iu;
 const SCOPED_APPROVAL_DIRECTIVE =
   /call the dynamic_scoped_approval tool exactly once with scope "([^"]+)"/iu;
 const REPLY_DIRECTIVE = /reply with exactly ([A-Z0-9-]+)/iu;
 const APPROVAL_FOLLOWUP_DIRECTIVE =
-  /call the (gate|read-status) tool exactly once with marker "([^"]+)"/iu;
+  /call the (gate|read-draft-status) tool exactly once with marker "([^"]+)"/iu;
 const ASK_QUESTION_DIRECTIVE = /call the ask_question tool exactly once with question "([^"]+)"/iu;
 
 /**
@@ -102,13 +103,19 @@ export default defineAgent({
   model: defineDynamic({
     events: {
       "session.started": () => ({
-        model: typeof base.model === "string" ? base.model : "openai/gpt-6-sol",
+        model: typeof base.model === "string" ? base.model : "openai/gpt-6.1-sol",
         modelContextWindowTokens: base.modelContextWindowTokens,
       }),
-      "step.started": (_event, ctx) =>
-        ctx.session.auth.initiator?.attributes?.model === "continuation"
-          ? { model: continuationModel(), modelContextWindowTokens: 1_000_000 }
-          : { model: base.model, modelContextWindowTokens: base.modelContextWindowTokens },
+      "step.started": (_event, ctx) => {
+        switch (ctx.session.auth.initiator?.attributes?.model) {
+          case "continuation":
+            return { model: continuationModel(), modelContextWindowTokens: 1_000_000 };
+          case "hitl":
+            return { model: humanInputModel(), modelContextWindowTokens: 1_000_000 };
+          default:
+            return { model: base.model, modelContextWindowTokens: base.modelContextWindowTokens };
+        }
+      },
     },
   }),
 });

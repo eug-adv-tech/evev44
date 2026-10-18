@@ -1,4 +1,5 @@
-import { getWorkflowMetadata } from "#compiled/@workflow/core/index.js";
+import { getStepMetadata, getWorkflowMetadata } from "#compiled/@workflow/core/index.js";
+import { SessionStrandedError } from "#channel/session-stranded-error.js";
 import { ContextContainer, contextStorage } from "#context/container.js";
 import type { SessionAuth } from "#context/session-context.js";
 import type { AgentSessionContext } from "#execution/agent-sessions/context.js";
@@ -15,9 +16,11 @@ import {
 import {
   createWorkflowRuntime,
   dispatchWorkflowSessionCommand,
-  requestWorkflowTurnCancellation,
   waitForCommandHookOwner,
+  resolveContinuation,
+  waitForSessionInbox,
 } from "#execution/workflow-runtime.js";
+import type { SessionCommand, SessionCommandResult } from "#channel/types.js";
 import { createLogger, logError } from "#internal/logging.js";
 import { createEveCallbackRoutePath } from "#protocol/routes.js";
 import { resolveDurableCompiledArtifactsSource } from "#runtime/durable-compiled-artifacts-source.js";
@@ -35,6 +38,8 @@ import {
 } from "#execution/agent-sessions/remote.js";
 import { buildSubagentRunInput } from "#subagents/tool.js";
 import { resolveConversationId } from "#shared/conversation-identity.js";
+import { stubToolPath } from "#tool-stubs/target.js";
+import { agentDelegation } from "#tracing/eve/delegation.js";
 
 const log = createLogger("execution.agent-sessions");
 
@@ -47,6 +52,8 @@ export type AgentSessionAddress =
       readonly name: string;
       readonly nodeId: string;
       readonly sessionId: string;
+      /** Names the session to whichever run holds its inbox. */
+      readonly continuationToken: string;
     }
   | {
       readonly callbackBaseUrl: string;
@@ -109,10 +116,11 @@ export async function openAgentSessionStep(
     isRootSession: context.parent.rootSessionId === context.parent.sessionId,
   });
   const start = { auth: input.auth, bundle, context, key: input.key, replyTo: input.replyTo };
-  if (target.kind === "remote") {
-    return await startRemoteSession({ ...start, target });
-  }
-  return await startLocalSession({ ...start, target });
+  const execute = () =>
+    target.kind === "remote"
+      ? startRemoteSession({ ...start, target })
+      : startLocalSession({ ...start, target });
+  return await agentDelegation.resume({ context, agentName: action.name }, execute);
 }
 
 /**
@@ -145,9 +153,11 @@ export async function sendAgentSessionMessageStep(
     });
     return;
   }
-  const result = await dispatchWorkflowSessionCommand({
-    command: {
+  const result = await commandLocalSession(
+    { ...input, address },
+    {
       auth: input.auth.current,
+      schedule: context.schedule,
       caller: {
         callId: context.parent.callId,
         replyTo: { kind: "hook", token: input.replyTo },
@@ -156,7 +166,11 @@ export async function sendAgentSessionMessageStep(
       kind: "send",
       payload: { message: input.message, outputSchema: input.outputSchema },
     },
-    sessionId: address.sessionId,
+  ).catch((error: unknown) => {
+    if (!SessionStrandedError.is(error)) throw error;
+    throw new Error(`Agent "${address.name}" can no longer receive messages: ${error.message}`, {
+      cause: error,
+    });
   });
   if (result.status !== "accepted") {
     throw new Error(`Agent "${address.name}" can no longer receive messages; its session ended.`);
@@ -174,7 +188,7 @@ export async function cancelAgentSessionTurnStep(input: OpenedAgentSession): Pro
       await cancelRemoteAgentTurn({ remote, sessionId: address.sessionId });
       return;
     }
-    await requestWorkflowTurnCancellation({ sessionId: address.sessionId });
+    await commandLocalSession({ ...input, address }, { kind: "cancel" });
   } catch (error) {
     logError(log, "failed to cancel an agent session turn", error, {
       name: address.name,
@@ -192,7 +206,8 @@ export async function endAgentSessionsStep(input: {
   await Promise.all(input.sessions.map(endAgentSession));
 }
 
-async function endAgentSession({ address, context }: OpenedAgentSession): Promise<void> {
+async function endAgentSession(opened: OpenedAgentSession): Promise<void> {
+  const { address, context } = opened;
   try {
     if (address.kind === "remote") {
       const remote = await resolveSessionRemote(context, address);
@@ -203,16 +218,40 @@ async function endAgentSession({ address, context }: OpenedAgentSession): Promis
       });
       return;
     }
-    await dispatchWorkflowSessionCommand({
-      command: { kind: "reset", reason: RUN_FINISHED_REASON },
-      sessionId: address.sessionId,
-    });
+    await commandLocalSession(
+      { ...opened, address },
+      { kind: "reset", reason: RUN_FINISHED_REASON },
+    );
   } catch (error) {
     logError(log, "failed to end an agent session", error, {
       name: address.name,
       sessionId: address.sessionId,
     });
   }
+}
+
+type LocalAgentSession = OpenedAgentSession & {
+  readonly address: Extract<AgentSessionAddress, { readonly kind: "local" }>;
+};
+
+/**
+ * Sends a command to a local session. A session opens without waiting for its
+ * run to claim its inbox, so a command it refuses before then waits for it.
+ * A duplicate start of the session can claim it instead of the run the open
+ * recorded, and the command then goes to the session holding its continuation.
+ */
+async function commandLocalSession<TCommand extends SessionCommand>(
+  opened: LocalAgentSession,
+  command: TCommand,
+): Promise<SessionCommandResult<TCommand>> {
+  const { continuationToken, sessionId } = opened.address;
+  const result = await dispatchWorkflowSessionCommand({ command, sessionId });
+  if (result.status === "accepted" || result.status === "reset") return result;
+  const current = (await waitForSessionInbox(sessionId))
+    ? sessionId
+    : (await resolveContinuation(continuationToken))?.sessionId;
+  if (current === undefined) return result;
+  return await dispatchWorkflowSessionCommand({ command, sessionId: current });
 }
 
 interface SessionStart<Target extends SubagentStartTarget> {
@@ -233,6 +272,7 @@ async function startLocalSession(
     action,
     auth: auth.current,
     capabilities: context.capabilities,
+    schedule: context.schedule,
     channelMetadata: context.channelMetadata,
     continuationKey: input.key,
     graph: bundle.graph,
@@ -254,11 +294,37 @@ async function startLocalSession(
     dynamicSubagentAgentConfig: target.dynamicSubagentAgentConfig,
     nodeId: action.nodeId,
   });
-  await contextStorage.run(new ContextContainer({ localDevRequest: context.localDevRequest }), () =>
-    childRuntime.createSession(runInput),
+  let childToolStubs = context.toolStubs;
+  if (childToolStubs !== undefined) {
+    childToolStubs = {
+      ...childToolStubs,
+      agentPath: stubToolPath(childToolStubs, action.name),
+    };
+  }
+  const started = await contextStorage.run(
+    new ContextContainer({ localDevRequest: context.localDevRequest }),
+    () =>
+      childRuntime.createSession({
+        ...runInput,
+        toolStubs: childToolStubs,
+      }),
   );
-  const owner = await waitForCommandHookOwner(sessionInboxHookToken(childContinuationToken));
-  return { kind: "local", name: action.name, nodeId: action.nodeId, sessionId: owner.runId };
+  // Waiting for the run to claim the session would hold the caller for the
+  // child's boot. A retried attempt may have started a second run, so it waits
+  // to learn which run claimed the session; later commands resolve it again.
+  let sessionId = started.sessionId;
+  if (getStepMetadata().attempt > 1) {
+    ({ runId: sessionId } = await waitForCommandHookOwner(
+      sessionInboxHookToken(childContinuationToken),
+    ));
+  }
+  return {
+    continuationToken: childContinuationToken,
+    kind: "local",
+    name: action.name,
+    nodeId: action.nodeId,
+    sessionId,
+  };
 }
 
 async function startRemoteSession(

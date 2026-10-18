@@ -1,6 +1,6 @@
 import type { FlexibleSchema } from "ai";
 
-import type { Approval } from "#approval/definition.js";
+import type { ToolApproval } from "#approval/definition.js";
 import type {
   InternalToolDefinition,
   InternalToolLabelDefinition,
@@ -17,16 +17,19 @@ export interface HarnessToolDefinition {
   readonly label?: InternalToolLabelDefinition;
   readonly approvalKey?: (toolInput: Readonly<Record<string, unknown>>) => string;
   readonly behavior?: PreparedToolBehavior;
+  /** Kept out of the model's tool list; the model reaches it through `eve__search` and `eve__tool`. */
+  readonly deferred?: boolean;
   readonly description: string;
   /** A successful call ends the turn without a final reply; see `ToolDefinition.endsTurn`. */
   readonly endsTurn?: InternalToolDefinition["endsTurn"];
   readonly execute?: (input: any, options: ToolExecuteOptions) => any;
   /** Optional JSON input substituted when this tool starts its workflow body. */
   readonly executeInput?: (input: unknown) => JsonValue;
-  readonly frameworkAction?: "load-skill" | "task-cancel" | "task-wait";
+  readonly frameworkTool?: boolean;
+  readonly frameworkAction?: "task-cancel" | "task-wait";
   readonly inputSchema: FlexibleSchema;
   readonly name: string;
-  readonly approval?: Approval;
+  readonly approval?: ToolApproval;
   readonly outputSchema?: FlexibleSchema;
   /**
    * Advertise this tool only to the root session, hiding it from subagent

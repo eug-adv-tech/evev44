@@ -1,26 +1,14 @@
 /**
- * Typing-indicator text for the turn's calls. It uses each call's start label,
- * the same text its task card row shows, so both surfaces name a call the same
- * way: `Run pnpm test`, `researcher: Find the March incidents`.
+ * Typing-indicator text for the turn's calls. A call reads as its
+ * `actionLabel`, the same text its task card row shows, so both surfaces name a
+ * call the same way: `Run pnpm test`, `researcher: Find the March incidents`.
  */
-import type { ActionPresentationByCallId } from "#protocol/message.js";
-import { actionRequestName } from "#shared/action-request-name.js";
-import type { RuntimeActionRequest } from "#shared/action-types.js";
-import { displayName, displayTitle } from "#shared/display-name.js";
+import { displayName } from "#shared/display-name.js";
 import { AGENT_TOOL_NAME } from "#tools/framework/agent-contract.js";
 
-/**
- * The first call's label, or its tool or agent display title, plus `+N more`
- * when the model requested several calls at once.
- */
-export function describeActionRequests(
-  actions: readonly RuntimeActionRequest[],
-  presentation: ActionPresentationByCallId | undefined,
-): string {
-  const [first] = actions;
-  if (first === undefined) return "Working...";
-  const label = presentation?.[first.callId]?.label ?? displayTitle(actionRequestName(first));
-  return actions.length === 1 ? label : `${label} +${String(actions.length - 1)} more`;
+/** The first call's label, plus `+N more` when the model made several calls in one step. */
+export function withMoreCalls(label: string, count: number): string {
+  return count <= 1 ? label : `${label} +${String(count - 1)} more`;
 }
 
 /**
@@ -34,4 +22,15 @@ export function waitingOnTasks(names: readonly string[]): string {
   return names.length === 1
     ? "Waiting on a task..."
     : `Waiting on ${String(names.length)} tasks...`;
+}
+
+/**
+ * `Reviewing researcher's results...` when every settled task called the same
+ * named agent, otherwise `Reviewing results...`. `null` stands for a task
+ * that isn't a named agent call.
+ */
+export function reviewingResults(names: readonly (string | null)[]): string {
+  const [first] = names;
+  const named = first != null && first !== AGENT_TOOL_NAME && names.every((name) => name === first);
+  return named ? `Reviewing ${displayName(first)}'s results...` : "Reviewing results...";
 }

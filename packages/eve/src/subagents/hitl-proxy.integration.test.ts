@@ -1,4 +1,7 @@
+import { toProxyInputRequestEntries } from "#harness/hitl/relays.js";
 import { describe, expect, it } from "vitest";
+
+import { readHitlState } from "#harness/hitl/requests.js";
 
 import type { ChannelAdapter, ChannelAdapterContext } from "#channel/adapter.js";
 import { buildAdapterContext } from "#channel/adapter-context.js";
@@ -9,8 +12,11 @@ import { ContextContainer } from "#context/container.js";
 import type { CompiledBundle } from "#runtime/sessions/runtime-context-keys.js";
 import { BundleKey, ChannelKey } from "#runtime/sessions/runtime-context-keys.js";
 import { serializeContext } from "#context/serialize.js";
-import { setHarnessEmissionState } from "#harness/emission-state.js";
-import { hasProxyInputRequests, upsertProxyInputRequests } from "#harness/proxy-input-requests.js";
+import { applyTransition, sessionView } from "#harness/session-machine/commit.js";
+import { relay } from "#harness/session-machine/transitions.js";
+import { storedProjection } from "#harness/session-machine/view.js";
+import { withOpenTurn, withRelays } from "#internal/testing/session-machine.js";
+
 import type { HarnessEmitFn, HarnessSession } from "#harness/types.js";
 import type { UnstampedMessageStreamEvent } from "#protocol/message.js";
 import type { InputRequest } from "#shared/input.js";
@@ -18,7 +24,7 @@ import { createRuntimeAdapterRegistry } from "#runtime/channels/registry.js";
 import type { RuntimeCompiledArtifactsSource } from "#runtime/compiled-artifacts-source.js";
 import { createRuntimeHookRegistry } from "#runtime/hooks/registry.js";
 import type { ResolvedChannelDefinition } from "#runtime/types.js";
-import { emitProxiedInputRequest, routeDeliverPayload } from "#subagents/hitl-proxy.js";
+import { routeDeliverPayload } from "#subagents/hitl-proxy.js";
 
 /**
  * Integration coverage for subagent HITL proxy emission and routing.
@@ -166,12 +172,22 @@ function buildEmptySession(continuationToken: string, sessionId: string): Harnes
 }
 
 function buildOpenTurnSession(continuationToken: string, sessionId: string): HarnessSession {
-  return setHarnessEmissionState(buildEmptySession(continuationToken, sessionId), {
-    sessionStarted: true,
+  return withOpenTurn(buildEmptySession(continuationToken, sessionId), {
     sequence: 3,
     stepIndex: 1,
     turnId: "turn_3",
   });
+}
+
+/** Relays a child's batch through the parent's machine, returning the routes it leaves. */
+async function emitProxiedInputRequest(input: {
+  readonly emit: HarnessEmitFn;
+  readonly hookPayload: Parameters<typeof toProxyInputRequestEntries>[0];
+  readonly session: HarnessSession;
+}) {
+  const view = sessionView(storedProjection(input.session.state), input.session.state);
+  await applyTransition(input.session, relay(view, { payload: input.hookPayload }), input.emit);
+  return toProxyInputRequestEntries(input.hookPayload);
 }
 
 /**
@@ -259,6 +275,7 @@ describe("subagent HITL proxy → Slack-style text-approve regression (Finding #
           childContinuationToken: "subagent:parent:call-1",
           event: { sequence: 0, stepIndex: 0, turnId: "turn_0" },
           kind: "tool-approval",
+          reply: { options: approvalRequest.options },
         },
       ],
     ]);
@@ -312,10 +329,9 @@ describe("subagent HITL proxy → Slack-style text-approve regression (Finding #
     // The resolved responses now flow through the proxy router. With
     // the child's proxy entry recorded on the parent session, the
     // response routes back down to the right descendant.
-    const parkedSession = upsertProxyInputRequests({
-      entries,
+    const parkedSession = withRelays(buildEmptySession("parent-token", "sess-parent"), {
+      entries: entries,
       forChildContinuationToken: hookPayload.childContinuationToken,
-      session: buildEmptySession("parent-token", "sess-parent"),
     });
 
     const routed = routeDeliverPayload({
@@ -330,17 +346,8 @@ describe("subagent HITL proxy → Slack-style text-approve regression (Finding #
         payload: {
           inputResponses: [{ optionId: "approve", requestId: "req-approve-1" }],
         },
-        resolved: {
-          event: { sequence: 0, stepIndex: 0, turnId: "turn_0" },
-          resolutions: [
-            {
-              kind: "tool-approval",
-              outcome: "approved",
-              requestId: "req-approve-1",
-              response: { optionId: "approve", requestId: "req-approve-1" },
-            },
-          ],
-        },
+        // The child decides the approval, so it stays open here until the child settles it.
+        resolved: { event: { sequence: 0, stepIndex: 0, turnId: "turn_0" }, resolutions: [] },
       },
     ]);
   });
@@ -409,18 +416,16 @@ describe("subagent HITL proxy → concurrent-descendant routing", () => {
     // entries (what the parent runtime would accumulate across the
     // two proxy steps).
     let parkedSession = buildEmptySession("parent-token", "sess-parent");
-    parkedSession = upsertProxyInputRequests({
+    parkedSession = withRelays(parkedSession, {
       entries: entriesA,
       forChildContinuationToken: payloadA.childContinuationToken,
-      session: parkedSession,
     });
-    parkedSession = upsertProxyInputRequests({
+    parkedSession = withRelays(parkedSession, {
       entries: entriesB,
       forChildContinuationToken: payloadB.childContinuationToken,
-      session: parkedSession,
     });
 
-    expect(hasProxyInputRequests(parkedSession.state)).toBe(true);
+    expect(readHitlState(parkedSession.state).relays.size > 0).toBe(true);
 
     // One inbound deliver carrying responses for both descendants.
     // Simulates a UI that lets the user answer both prompts before

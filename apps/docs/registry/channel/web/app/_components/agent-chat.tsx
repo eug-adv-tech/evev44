@@ -3,7 +3,7 @@
 import type { UserContent } from "ai";
 import { useEveAgent } from "eve/react";
 import { AlertCircleIcon, BrainIcon, PlusIcon, SquareIcon } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   Conversation,
   ConversationContent,
@@ -37,8 +37,21 @@ export function AgentChat({
 }) {
   const [cancellationError, setCancellationError] = useState<string>();
   const [hasInputText, setHasInputText] = useState(false);
+  const hasSubmittedMessage = useRef(false);
+  const replaceSessionRoute = (nextSessionId: string) => {
+    if (sessionId !== undefined) return;
+    // Framework routers (Next.js, TanStack Router) patch window.history; navigating
+    // through them would remount this route and detach the active stream.
+    History.prototype.replaceState.call(
+      window.history,
+      window.history.state,
+      "",
+      `/s/${encodeURIComponent(nextSessionId)}`,
+    );
+  };
   const agent = useEveAgent({
     agent: WEB_CHAT_AGENT,
+    prewarm: hasInputText,
     initialSession:
       sessionId === undefined
         ? undefined
@@ -48,14 +61,8 @@ export function AgentChat({
           },
     resume: sessionId !== undefined,
     onSessionChange(session) {
-      if (sessionId === undefined && session !== undefined) {
-        // Next patches window.history to navigate, which would detach the active stream.
-        History.prototype.replaceState.call(
-          window.history,
-          window.history.state,
-          "",
-          `/s/${encodeURIComponent(session.sessionId)}`,
-        );
+      if (hasSubmittedMessage.current && session !== undefined) {
+        replaceSessionRoute(session.sessionId);
       }
     },
   });
@@ -78,6 +85,11 @@ export function AgentChat({
   // Answers are accepted while work runs; the server's settlement closes each request.
   const canRespond = (requestId: string) =>
     !isResuming && agent.data.inputs[requestId]?.status === "open";
+  // A tool call can ask several questions at once, and its message part holds only the latest.
+  const questionsFor = (callId: string) =>
+    Object.values(agent.data.inputs).filter(
+      (input) => input.request.kind === "question" && input.request.action.callId === callId,
+    );
 
   const requestCancellation = () => {
     setCancellationError(undefined);
@@ -92,6 +104,8 @@ export function AgentChat({
 
     setHasInputText(false);
     setCancellationError(undefined);
+    hasSubmittedMessage.current = true;
+    if (agent.session !== undefined) replaceSessionRoute(agent.session.sessionId);
     const options = isBusy ? { turnPolicy: "steer" as const } : undefined;
 
     if (message.files.length === 0) {
@@ -161,6 +175,7 @@ export function AgentChat({
                   }
                   key={message.id}
                   message={message}
+                  questionsFor={questionsFor}
                   onInputResponses={(inputResponses) => {
                     setCancellationError(undefined);
                     return agent.respond(inputResponses);

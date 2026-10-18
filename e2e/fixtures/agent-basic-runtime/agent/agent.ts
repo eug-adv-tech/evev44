@@ -3,7 +3,7 @@ import { defineAgent, defineDynamic } from "eve";
 import { mockModel } from "eve/evals";
 
 const DISABLED_AGENT_TOOL_REQUEST = "E2E_DISABLED_ROOT_AGENT_TOOL";
-const CHILD_REQUEST = 'Call final_output exactly once with {"answer":"client-recursion-ok"}.';
+const CHILD_REQUEST = 'Call eve__reply exactly once with {"answer":"client-recursion-ok"}.';
 const disabledAgentToolModel = mockModel({
   modelId: "disabled-root-agent-tool",
   respond: ({ tools }) => {
@@ -16,12 +16,18 @@ const disabledAgentToolModel = mockModel({
 const childModel = mockModel({
   modelId: "recursive-client-result-child",
   respond: () => ({
-    toolCalls: [{ name: "final_output", input: { answer: "client-recursion-ok" } }],
+    toolCalls: [{ name: "eve__reply", input: { answer: "client-recursion-ok" } }],
   }),
 });
 
 const config = e2eAgentConfig({
   mock: ({ lastUserMessage, toolResults, userMessages }) => {
+    if (lastUserMessage?.includes("inspect_trace")) {
+      const result = toolResults.find((entry) => entry.name === "inspect_trace");
+      return result === undefined
+        ? { toolCalls: [{ name: "inspect_trace", input: {} }] }
+        : JSON.stringify(result.output);
+    }
     if (lastUserMessage?.includes("favorite word") && lastUserMessage.includes("?")) {
       const remembered = userMessages
         .map((message) => /My favorite word is (\w+)/u.exec(message)?.[1])
@@ -42,7 +48,7 @@ const config = e2eAgentConfig({
     }
     if (lastUserMessage === CHILD_REQUEST) {
       return {
-        toolCalls: [{ name: "final_output", input: { answer: "client-recursion-ok" } }],
+        toolCalls: [{ name: "eve__reply", input: { answer: "client-recursion-ok" } }],
       };
     }
     return `Mock reply: ${lastUserMessage ?? ""}`;

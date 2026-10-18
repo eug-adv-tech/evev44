@@ -1,6 +1,5 @@
 import type { StandardSchemaV1 } from "#compiled/@standard-schema/spec/index.js";
 import type { HarnessToolDefinition } from "#harness/execute-tool.js";
-import type { HarnessToolMap } from "#harness/types.js";
 import type { ContextReader } from "#context/key.js";
 import {
   SessionIdKey,
@@ -17,6 +16,7 @@ import { createToolExecuteWithAuth } from "#execution/tool-auth.js";
 import { createLogger } from "#internal/logging.js";
 import type {
   ApprovalContext,
+  ApprovalPromptContext,
   ApprovalResponseContext,
   ApprovalResponseDecision,
   ApprovalStatus,
@@ -70,28 +70,46 @@ function buildReplayedApproval(
             context,
           )) as ApprovalStatus;
 
+  const promptReference = metadata.callbacks.approvalPrompt;
+  const prompt =
+    promptReference === undefined
+      ? undefined
+      : lookupDurableDynamicCallback(owner, "approvalPrompt");
+  if (promptReference !== undefined && prompt === undefined) {
+    log.error(missingCallbackError(metadata, "approvalPrompt").message);
+  }
   const responseReference = metadata.callbacks.approvalResponse;
-  if (responseReference === undefined) return requestPolicy;
+  const response =
+    responseReference === undefined
+      ? undefined
+      : lookupDurableDynamicCallback(owner, "approvalResponse");
+  if (prompt === undefined && responseReference === undefined) return requestPolicy;
 
-  const response = lookupDurableDynamicCallback(owner, "approvalResponse");
   return {
     request: requestPolicy,
+    prompt:
+      prompt === undefined || promptReference === undefined
+        ? undefined
+        : (context: ApprovalPromptContext) =>
+            callDurableDynamicCallback(prompt, promptReference.closure, context) as string,
     response:
-      response === undefined
-        ? async () => {
-            const error = missingCallbackError(metadata, "approvalResponse");
-            log.error(error.message);
-            return {
-              reason: error.message,
-              status: "rejected" as const,
-            };
-          }
-        : async (context: ApprovalResponseContext) =>
-            (await callDurableDynamicCallback(
-              response,
-              responseReference.closure,
-              context,
-            )) as ApprovalResponseDecision,
+      responseReference === undefined
+        ? undefined
+        : response === undefined
+          ? async () => {
+              const error = missingCallbackError(metadata, "approvalResponse");
+              log.error(error.message);
+              return {
+                reason: error.message,
+                status: "rejected" as const,
+              };
+            }
+          : async (context: ApprovalResponseContext) =>
+              (await callDurableDynamicCallback(
+                response,
+                responseReference.closure,
+                context,
+              )) as ApprovalResponseDecision,
   };
 }
 
@@ -141,6 +159,8 @@ export function replayDynamicTools(
       -readonly [K in keyof HarnessToolDefinition]: HarnessToolDefinition[K];
     } = {
       availableInSubagents: entry.availableInSubagents,
+      deferred: entry.deferred,
+      frameworkTool: entry.frameworkTool,
       description: entry.description,
       endsTurn: entry.endsTurn,
       execute: createToolExecuteWithAuth({
@@ -257,24 +277,7 @@ function requireCurrentDynamicToolMetadata(
   return metadata as readonly CurrentDynamicToolMetadata[];
 }
 
-/**
- * Builds live dynamic tool definitions. Narrower scopes appear first so they
- * win on name collision (the tool loop uses `??=` for deduplication).
- */
-export function buildResponseAuthorizationTools(input: {
-  readonly authoredTools: HarnessToolMap;
-  readonly context?: ContextReader;
-}): HarnessToolMap {
-  const tools = new Map<string, HarnessToolDefinition>();
-  for (const tool of input.context === undefined ? [] : buildDynamicTools(input.context)) {
-    if (!tools.has(tool.name)) tools.set(tool.name, tool);
-  }
-  for (const [name, tool] of input.authoredTools) {
-    if (!tools.has(name)) tools.set(name, tool);
-  }
-  return tools;
-}
-
+/** Builds live dynamic tool definitions. Narrower scopes appear first so they win on name collision. */
 export function buildDynamicTools(ctx: ContextReader): readonly HarnessToolDefinition[] {
   const step = replayDynamicTools(
     requireCurrentDynamicToolMetadata(ctx.get(StepDynamicToolMetadataKey) ?? []),
@@ -289,4 +292,11 @@ export function buildDynamicTools(ctx: ContextReader): readonly HarnessToolDefin
     { sessionId: ctx.get(SessionIdKey) ?? "", scope: "session" },
   );
   return [...step, ...turn, ...session];
+}
+
+/** The names of the dynamic tools every scope holds. */
+export function dynamicToolNames(ctx: ContextReader): readonly string[] {
+  return [StepDynamicToolMetadataKey, TurnDynamicToolMetadataKey, SessionDynamicToolMetadataKey]
+    .flatMap((key) => ctx.get(key) ?? [])
+    .map((metadata) => metadata.name);
 }

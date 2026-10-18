@@ -1,5 +1,6 @@
+import { startSessionOwner } from "#internal/testing/workflow-test-helpers.js";
 import { describe, expect, it } from "vitest";
-import { getWorld, start } from "#internal/workflow/runtime.js";
+import { getWorld } from "#internal/workflow/runtime.js";
 import { captureTurnEvents, filterEventsByType } from "#internal/testing/events.js";
 import { workflowEntry } from "#execution/session/entry.js";
 import { sessionCommandHookToken } from "#execution/session-inbox/address.js";
@@ -24,7 +25,7 @@ describe("workflow step authorization failures", () => {
         toolName: "deploy_service",
       });
       await runtime.run(async () => {
-        const run = await start(workflowEntry, [
+        const run = await startSessionOwner(workflowEntry, [
           {
             kind: "initial",
             ownerDeploymentId: "dpl_inline",
@@ -47,7 +48,9 @@ describe("workflow step authorization failures", () => {
         const stream = captureTurnEvents(run);
         try {
           // The sign-in parks the open turn; the run keeps waiting for its callback.
-          const events = await stream.nextUntil((event) => event.type === "turn.waiting");
+          const events = await stream.nextUntil(
+            (event) => event.type === "turn.waiting" && event.data.on === "input",
+          );
           expect(events.at(-2)?.type).toBe("authorization.required");
           expect(filterEventsByType(events, "turn.completed")).toHaveLength(0);
           const required = filterEventsByType(events, "authorization.required")[0]!;

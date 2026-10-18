@@ -115,6 +115,12 @@ export interface UseEveAgentOptions<TData> extends EveAgentStoreCallbacks<TData>
   /** Follow each subagent call's session into `conversation.agents` while mounted. @default false */
   readonly followSubagents?: boolean;
   /**
+   * Keep the session stream open between turns to show events that arrive from schedules,
+   * channels, or other clients. Set to false to close it once the session is idle and reopen it
+   * on the next send, answer, or resume. @default true
+   */
+  readonly followIdle?: boolean;
+  /**
    * Prewarm an owned session when true. React observes this value across renders;
    * changing it from false to true prepares the current session, and reset checks
    * the latest rendered value before preparing the next session.
@@ -163,6 +169,7 @@ export function useEveAgent<TData>(
   options: UseEveAgentOptions<TData> = {},
 ): UseEveAgentHelpers<TData> {
   const storeRef = useRef<EveAgentStore<TData> | undefined>(undefined);
+  const mountedRef = useRef(false);
   const resumeOnMountRef = useRef(options.resume ?? false);
   const [autoResumePending, setAutoResumePending] = useState(resumeOnMountRef.current);
   const [prewarmResetGeneration, setPrewarmResetGeneration] = useState(0);
@@ -185,6 +192,7 @@ export function useEveAgent<TData>(
       initialSession: options.initialSession,
       optimistic: options.optimistic,
       followSubagents: options.followSubagents,
+      followIdle: options.followIdle,
       reducer,
       session: options.session,
     });
@@ -210,10 +218,15 @@ export function useEveAgent<TData>(
   );
 
   useEffect(() => {
+    mountedRef.current = true;
     const timeout = setTimeout(() => attachEveAgentStore(store), 0);
     return () => {
+      mountedRef.current = false;
       clearTimeout(timeout);
-      detachEveAgentStore(store);
+      // Strict Mode and Fast Refresh replay this cleanup and setup in one synchronous commit.
+      queueMicrotask(() => {
+        if (!mountedRef.current) detachEveAgentStore(store);
+      });
     };
   }, [store]);
   useEffect(() => {

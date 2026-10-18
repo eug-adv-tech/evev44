@@ -9,6 +9,7 @@ import {
   EveAgentStore,
 } from "#client/eve-agent-store.js";
 import { isAbortError } from "#client/eve-agent-store-helpers.js";
+import { formatStrandedSessionNotice } from "./stranded-session.js";
 import { normalizeActionRequest, normalizeActionResult } from "#client/message-action-parts.js";
 import { isTerminalToolCallPart } from "./terminal-tool-part.js";
 import { userText } from "./transcript-parts.js";
@@ -144,7 +145,8 @@ export type AgentTUIToolApprovalRequest = {
   approvalId: string;
   toolCallId: string;
   toolName: string;
-  title?: string;
+  /** The server's question for this approval, such as `Approve Deploy release?`. */
+  prompt: string;
   input: unknown;
   context?: AgentTUIInputContext;
 };
@@ -238,7 +240,7 @@ export type AgentTUIRenderer = {
   /**
    * Reports the server session id backing the conversation — pushed by the
    * runner once a send is accepted, and overwritten when a later session's
-   * turn is accepted. Deliberately sticky across `/reset` and interrupt
+   * turn is accepted. Deliberately sticky across `/new` and interrupt
    * recovery: the terminal renderer echoes the LAST session this TUI talked
    * to in the parting line on exit, so an interrupted conversation (whose
    * replacement session never ran a turn) can still be found again
@@ -283,7 +285,7 @@ export type AgentTUIRenderer = {
   /**
    * Clears the rendered transcript and resets per-conversation display
    * state, leaving the UI interactive on a fresh screen. Used by the
-   * `/reset` command to start a new session with a clean slate.
+   * `/new` command to start a new session with a clean slate.
    */
   reset?(): void;
   /**
@@ -781,7 +783,7 @@ export class EveTUIRunner {
         });
         return;
       }
-      case "reset":
+      case "new":
         await this.#resetSession();
         return;
       case "compact":
@@ -795,8 +797,8 @@ export class EveTUIRunner {
       case "clear":
         await this.#runSessionCommand({
           absent: "No active session to clear",
+          accepted: "Session context cleared",
           failed: "Couldn't clear the session",
-          dismissOnAccepted: true,
           invoke: () => this.#store.clear(),
         });
         return;
@@ -852,10 +854,7 @@ export class EveTUIRunner {
         : { message, turnPolicy: "queue" };
     void this.#store.send(input).catch((error: unknown) => {
       if (this.#disposed || isAbortError(error)) return;
-      this.#renderer.renderError?.(
-        steering ? "Steering failed" : "Error",
-        this.#formatTransportError(error),
-      );
+      this.#renderSendError(steering ? "Steering failed" : "Error", error);
     });
   }
 
@@ -911,8 +910,31 @@ export class EveTUIRunner {
     if (error === undefined || error === this.#reportedError) return;
     this.#reportedError = error;
     if (sessionFailed) return;
-    this.#remoteConnection?.reportFailure(error);
-    this.#renderer.renderError?.("Error", this.#formatTransportError(error));
+    // A stranded session is a property of that session, not of the connection.
+    if (!this.#renderStrandedSession(error)) {
+      this.#remoteConnection?.reportFailure(error);
+      this.#renderer.renderError?.("Error", this.#formatTransportError(error));
+    }
+  }
+
+  #renderSendError(title: string, error: unknown): void {
+    if (this.#renderStrandedSession(error)) return;
+    this.#renderer.renderError?.(title, this.#formatTransportError(error));
+  }
+
+  #strandedSessionNotice(error: unknown): string | undefined {
+    return formatStrandedSessionNotice(error, {
+      localServer: this.#appRoot !== undefined,
+      sessionId: this.#store.snapshot.session?.sessionId,
+    });
+  }
+
+  /** Renders a stranded-session notice; false when `error` is anything else. */
+  #renderStrandedSession(error: unknown): boolean {
+    const notice = this.#strandedSessionNotice(error);
+    if (notice === undefined) return false;
+    this.#renderer.renderError?.("Session stranded", notice);
+    return true;
   }
 
   #reportFirstResponse(conversation: ConversationState): void {
@@ -953,7 +975,7 @@ export class EveTUIRunner {
       }
       void this.#store.send({ inputResponses: [response] }).catch((error: unknown) => {
         if (this.#disposed || isAbortError(error)) return;
-        this.#renderer.renderError?.("Error", this.#formatTransportError(error));
+        this.#renderSendError("Error", error);
       });
     }
   }
@@ -1031,9 +1053,8 @@ export class EveTUIRunner {
   /** Runs a session mutation and gives every control command one completion policy. */
   async #runSessionCommand(input: {
     readonly absent: string;
-    readonly accepted?: string;
+    readonly accepted: string;
     readonly failed: string;
-    readonly dismissOnAccepted?: boolean;
     readonly invoke: () => Promise<{ status: string }>;
   }): Promise<void> {
     if (this.#store.snapshot.session === undefined) {
@@ -1046,15 +1067,11 @@ export class EveTUIRunner {
         this.#finishCommand({ kind: "result", summary: input.absent });
         return;
       }
-      this.#finishCommand(
-        input.dismissOnAccepted === true
-          ? { kind: "dismiss" }
-          : { kind: "result", summary: input.accepted },
-      );
+      this.#finishCommand({ kind: "result", summary: input.accepted });
     } catch (error) {
       this.#finishCommand({
         kind: "result",
-        message: toErrorMessage(error),
+        message: this.#strandedSessionNotice(error) ?? toErrorMessage(error),
         summary: input.failed,
       });
     }
@@ -1577,6 +1594,16 @@ export class EveTUIRunner {
           });
         }
         break;
+      // A task call's receipt never fails; its task's outcome does.
+      case "task.settled":
+        if (event.data.status === "failed") {
+          diagnostics.append({
+            source: "tool",
+            summary: `${this.#store.snapshot.conversation.tasks[event.data.taskId]?.name ?? "A task"} failed`,
+            detail: event.data.error?.message ?? "Task failed.",
+          });
+        }
+        break;
       case "agent.started":
         diagnostics.recordSubagentDispatch(event.data.callId);
         break;
@@ -1704,6 +1731,7 @@ function toAgentTUIToolApprovalRequest(
     approvalId: request.requestId,
     toolCallId: request.action.callId,
     toolName: request.action.toolName,
+    prompt: request.prompt,
     input: request.action.input,
   };
   if (context !== undefined) approval.context = context;

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { decodeBytesToUtf8, defineCommand, MountableFs, ReadWriteFs } from "just-bash";
@@ -9,6 +9,7 @@ import { useTemporaryDirectories } from "#internal/testing/use-temporary-app-roo
 import { createJustBashSandboxProvider } from "#execution/sandbox/bindings/just-bash.js";
 import { createSandboxProviderHarness } from "#internal/testing/sandbox-provider-harness.js";
 import type { JustBashSandboxCreateOptions } from "#public/sandbox/just-bash-sandbox.js";
+import { executeBashOnSandbox } from "#execution/sandbox/bash.js";
 import { executeGlobOnSandbox } from "#execution/sandbox/glob-tool.js";
 import { executeGrepOnSandbox } from "#execution/sandbox/grep-tool.js";
 
@@ -166,12 +167,32 @@ describe("just-bash sandbox file API", () => {
     });
 
     const result = await handle.sandbox.run({
-      command: 'echo "$DEPLOY_ENV"',
+      command: 'echo "$DEPLOY_ENV $AI_AGENT"',
       env: { DEPLOY_ENV: "staging" },
     });
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("staging");
+    expect(result.stdout.trim()).toBe("staging eve");
+  });
+
+  it("runs bash tool commands directly because just-bash cannot host background jobs", async () => {
+    const cacheDirectory = await createTemporaryCacheDirectory("bash-tool");
+    const handle = await createPrewarmedLocalHandle({
+      appRoot: cacheDirectory,
+      sandboxName: "session-bash-tool",
+    });
+
+    const result = await executeBashOnSandbox(handle.sandbox, {
+      command: "echo out; echo err >&2; exit 3",
+    });
+
+    expect(result).toEqual({
+      exitCode: 3,
+      status: "completed",
+      stderr: "err\n",
+      stdout: "out\n",
+      truncated: false,
+    });
   });
 
   it("passes env vars to a process spawned via the public session", async () => {
@@ -277,7 +298,7 @@ describe("just-bash sandbox file API", () => {
       path: "persisted.txt",
     });
 
-    await firstHandle.onSessionStop();
+    await firstHandle.onSandboxStop();
 
     expect(state).toMatchObject({ version: 2 });
     await expect(
@@ -417,6 +438,36 @@ describe("just-bash provider", () => {
       sandboxName: "session-from-repaired-template",
     });
     const result = await seededHandle.sandbox.run({
+      command: "find /workspace -maxdepth 3 -type f | sort",
+    });
+
+    expect(result.stdout.trim().split("\n")).toEqual(["/workspace/skills/weather.md"]);
+  });
+
+  it("opens a prewarmed template after the app moves to a different root", async () => {
+    const buildRoot = await createTemporaryCacheDirectory("build-root");
+    const runtimeRoot = await createTemporaryCacheDirectory("runtime-root");
+    const provider = createJustBashProvider();
+
+    const prepared = await provider.prepare({
+      appRoot: buildRoot,
+      seedFiles: [
+        {
+          content: "# Weather skill\n",
+          path: "/workspace/skills/weather.md",
+        },
+      ],
+    });
+    // Build in CI, then ship the cache to a different app root (#4606).
+    await cp(buildRoot, runtimeRoot, { recursive: true });
+    await rm(buildRoot, { force: true, recursive: true });
+
+    const handle = await provider.openSession({
+      appRoot: runtimeRoot,
+      prepared,
+      sandboxName: "session-after-move",
+    });
+    const result = await handle.sandbox.run({
       command: "find /workspace -maxdepth 3 -type f | sort",
     });
 

@@ -1,4 +1,4 @@
-import type { Approval } from "#approval/definition.js";
+import type { ToolApproval } from "#approval/definition.js";
 import type { DynamicResolveContext, DynamicToolEventName } from "#dynamic/definition.js";
 import type {
   PublicToolInputSchema,
@@ -13,7 +13,8 @@ import type { ToolModelOutput } from "#tools/model-output.js";
  *
  * Identity comes from context: a single returned entry is named after
  * the file slug; entries in a returned `Record<string, DynamicToolEntry>`
- * are each named `slug__key`.
+ * are each named by their bare key, prefixed with the mount namespace for an
+ * extension's resolver.
  *
  * `TInput` defaults to `Record<string, unknown>` but is inferred when
  * `inputSchema` is a Standard Schema (e.g. Zod) via the `defineTool`
@@ -23,6 +24,8 @@ import type { ToolModelOutput } from "#tools/model-output.js";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export interface DynamicToolEntry<TInput = Record<string, unknown>, TOutput = any> {
   readonly availableInSubagents?: boolean;
+  /** Keeps this entry out of the model's tool list, as `deferred` on `defineTool`. */
+  readonly deferred?: boolean;
   readonly label?: ToolLabelDefinition<TInput, TOutput>;
   readonly description: string;
   /**
@@ -41,7 +44,7 @@ export interface DynamicToolEntry<TInput = Record<string, unknown>, TOutput = an
    * before the call executes. Dynamic approval request and response callbacks
    * use the same durable descriptor boundary as `execute` and `toModelOutput`.
    */
-  readonly approval?: Approval;
+  readonly approval?: ToolApproval<TInput>;
   /** Derives the input-scoped key recorded when this tool is approved. */
   readonly approvalKey?: (toolInput: Readonly<Record<string, unknown>>) => string;
 }
@@ -58,7 +61,7 @@ export type DynamicToolSet = Readonly<Record<string, DynamicToolEntry<any, any>>
 
 /**
  * Return type for a `defineDynamic` event handler: a single tool entry
- * (named after the file slug), a map of entries (named `slug__key`), or
+ * (named after the file slug), a map of entries (named by their keys), or
  * `null` for no tools.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

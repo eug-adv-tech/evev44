@@ -7,6 +7,7 @@ import type { WorkflowBodyInput } from "#execution/tools/workflow/body.js";
 import { WORKFLOW_CANCELLATION_CLEANUP_MS } from "#execution/tools/workflow/cancellation-policy.js";
 import type {
   WorkflowBodyCommand,
+  WorkflowToolRunAnswer,
   WorkflowToolRunMessage,
   WorkflowToolRunRef,
 } from "#execution/tools/workflow/messages.js";
@@ -44,14 +45,17 @@ vi.mock("#execution/agent-sessions/steps.js", () => ({
 vi.mock("#compiled/@workflow/core/index.js", () => ({
   createHook: (options?: { readonly token?: string }) =>
     options?.token === "control"
-      ? (async function* () {
-          while (true) {
-            const command = mocks.commands.shift();
-            if (command !== undefined) yield command;
-            else await new Promise<void>((resolve) => (mocks.wakeCommands = resolve));
-          }
-        })()
-      : // Agent turns and the run's inbox never report; only what the run sends matters here.
+      ? Object.assign(
+          (async function* () {
+            while (true) {
+              const command = mocks.commands.shift();
+              if (command !== undefined) yield command;
+              else await new Promise<void>((resolve) => (mocks.wakeCommands = resolve));
+            }
+          })(),
+          { getConflict: async () => null },
+        )
+      : // Agent turns never report; only what the run sends matters here.
         {
           [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }),
           token: "agent-turn",
@@ -315,6 +319,29 @@ it("holds the outcome of a body that returns right after replying until its with
   expect(finished).toBe(false);
   withdrawalLands.resolve();
   await expect(started.outcome).resolves.toEqual({ output: null, status: "completed" });
+});
+
+it("replies and settles with a selected ctx.ask() answer as JSON, without its undefined text (#3836)", async () => {
+  mocks.deliver.mockReset();
+  const answer: WorkflowToolRunAnswer = { optionId: "yes", status: "answered", text: undefined };
+  mocks.serve.mockImplementation(
+    async (
+      receive: WorkflowServeReceive<JsonValue>,
+      ctx: WorkflowServeContext<WorkflowToolRunAnswer>,
+    ) => {
+      await receive();
+      ctx.reply(answer);
+      return answer;
+    },
+  );
+  const started = startServeBody(input);
+
+  const outcome = await started.outcome;
+  expect(outcome).toEqual({ output: { optionId: "yes", status: "answered" }, status: "completed" });
+  const output = outcome.status === "completed" ? outcome.output : null;
+  expect(Object.hasOwn(output as object, "text")).toBe(false);
+  const [reply] = sent("reply");
+  expect(Object.hasOwn(reply?.output as object, "text")).toBe(false);
 });
 
 it.each([

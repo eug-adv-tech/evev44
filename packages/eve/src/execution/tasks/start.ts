@@ -27,19 +27,23 @@ import {
 import { createRuntimeToolResultFromValue } from "#harness/action-result-helpers.js";
 import { createLogger, logError } from "#internal/logging.js";
 import type { HarnessSessionBase } from "#harness/types.js";
-import { createTaskStartedEvent, type TaskStartedStreamEvent } from "#protocol/message.js";
+import type { TaskStartedStreamEvent } from "#protocol/message.js";
 import { TOO_MANY_TASKS_CODE, UNKNOWN_TASK_CODE } from "#protocol/task-tools.js";
-import type { RuntimeToolResultActionResult, WorkflowToolRunEntry } from "#shared/action-types.js";
+import type {
+  RuntimeToolResultActionResult,
+  RuntimeWorkflowTaskRequest,
+  WorkflowToolRunEntry,
+} from "#shared/action-types.js";
 
 const log = createLogger("execution.tasks");
 
 type TaskDispatchInput = StartWorkflowTaskInput & { readonly taskId: string };
 
-/** The call's answer, and the `task.started` event the dispatch step publishes for it. */
+/** The call's answer, and the task start the dispatch step reports for it. */
 interface TaskDispatchResult {
   readonly result: RuntimeToolResultActionResult;
   readonly session: HarnessSessionBase;
-  readonly started?: TaskStartedStreamEvent;
+  readonly started?: TaskStartedStreamEvent["data"];
 }
 
 /** The entry of a run that does a task's work. */
@@ -59,11 +63,8 @@ export async function startTaskRun(
   const dispatch = { ...input, taskId };
   const receipt = startReceipt(dispatch, entry.entryPoint === "serve");
   const table = readTaskTable(session.state);
-  const record = findTask(table, taskId);
-  // Cancelled before the session could start it: there is nothing to run.
-  if (record === undefined || !isTaskWorking(record)) {
-    return { result: receipt, session };
-  }
+  const record = startableTask(table, taskId);
+  if (record === undefined) return { result: receipt, session };
 
   const overCap = tooManyTasks(dispatch, table);
   if (overCap !== undefined) {
@@ -125,14 +126,65 @@ export async function sendToTask(input: TaskDispatchInput): Promise<TaskDispatch
   };
 }
 
+/**
+ * The entry of the run that dispatching `task` starts, or `undefined` when it
+ * starts none: a call to a running task, or a task cancelled before the
+ * session could start it. The task cap can still refuse a task's run.
+ */
+export function runEntryToStart(
+  table: TaskTable,
+  task: RuntimeWorkflowTaskRequest,
+): WorkflowToolRunEntry | undefined {
+  const { entry } = task;
+  switch (entry.entryPoint) {
+    case "execute":
+      return { entryPoint: "execute" };
+    case "task":
+    case "serve":
+      return startableTask(table, entry.taskId) === undefined ? undefined : entry;
+    case "receive":
+      return undefined;
+  }
+}
+
+/** The task's record while it still needs its run, which it doesn't once cancelled. */
+function startableTask(table: TaskTable, taskId: string): TaskRecord | undefined {
+  const record = findTask(table, taskId);
+  return record !== undefined && isTaskWorking(record) ? record : undefined;
+}
+
+/**
+ * Whether dispatching `tasks` in order starts every run {@link runEntryToStart}
+ * names. A call to a running task can take a slot under the task cap, and
+ * sending to it can fail the batch, so such a batch never qualifies.
+ */
+export function startsEveryRun(
+  table: TaskTable,
+  tasks: readonly RuntimeWorkflowTaskRequest[],
+): boolean {
+  if (tasks.some((task) => task.entry.entryPoint === "receive")) return false;
+  const starting = tasks.filter(
+    (task) => task.entry.entryPoint !== "execute" && runEntryToStart(table, task) !== undefined,
+  );
+  return hasTaskSlots(table, starting.length);
+}
+
+function runningTasks(table: TaskTable): readonly TaskRecord[] {
+  return workingTasks(table).filter((candidate) => candidate.run !== undefined);
+}
+
+/** Whether the task cap leaves room to run `count` more tasks. */
+function hasTaskSlots(table: TaskTable, count: number): boolean {
+  return runningTasks(table).length + count <= MAX_WORKING_TASKS;
+}
+
 /** The `TOO_MANY_TASKS` error when the session already runs as many tasks as it may. */
 function tooManyTasks(
   input: TaskDispatchInput,
   table: TaskTable,
 ): RuntimeToolResultActionResult | undefined {
-  const running = workingTasks(table).filter((candidate) => candidate.run !== undefined);
-  if (running.length < MAX_WORKING_TASKS) return undefined;
-  const runningIds = running.map((candidate) => candidate.id);
+  if (hasTaskSlots(table, 1)) return undefined;
+  const runningIds = runningTasks(table).map((candidate) => candidate.id);
   return createRuntimeToolResultFromValue({
     callId: input.task.callId,
     isError: true,
@@ -156,14 +208,17 @@ function unknownTaskResult(input: TaskDispatchInput): RuntimeToolResultActionRes
   });
 }
 
-function taskStartedEvent(input: TaskDispatchInput, record: TaskRecord): TaskStartedStreamEvent {
-  return createTaskStartedEvent({
+function taskStartedEvent(
+  input: TaskDispatchInput,
+  record: TaskRecord,
+): TaskStartedStreamEvent["data"] {
+  return {
     callId: input.task.callId,
     kind: record.kind,
     name: input.task.toolName,
     taskId: input.taskId,
     turnId: input.batchEvent.turnId,
-  });
+  };
 }
 
 function startReceipt(input: TaskDispatchInput, resumable: boolean): RuntimeToolResultActionResult {

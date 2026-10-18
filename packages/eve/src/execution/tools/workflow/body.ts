@@ -1,4 +1,7 @@
+import { findStubTarget, stubCallId } from "#tool-stubs/target.js";
+import { toolStubOutput } from "#tool-stubs/output.js";
 import { getWorkflowMetadata } from "#compiled/@workflow/core/index.js";
+import { callToolStubStep } from "#execution/tool-stubs/steps.js";
 
 import type { SessionContext } from "#context/session-context.js";
 import type { AgentSessionContext } from "#execution/agent-sessions/context.js";
@@ -23,8 +26,9 @@ import type {
 import type { WorkflowToolRunInbox } from "#execution/tools/workflow/owner.js";
 import { normalizeSerializableError } from "#execution/workflow-errors.js";
 import { readRegisteredWorkflow } from "#execution/workflow-registry.js";
+import { withToolOutputSerializationError } from "#harness/tool-output-serialization.js";
 import type { WorkflowToolRunEntry } from "#shared/action-types.js";
-import type { JsonObject, JsonValue } from "#shared/json.js";
+import { parseJsonValue, type JsonObject, type JsonValue } from "#shared/json.js";
 import type { ToolContext } from "#tools/definition.js";
 
 export interface WorkflowBodyDefinition {
@@ -172,9 +176,20 @@ async function executeCallBody(
   from: WorkflowToolRunRef,
 ): Promise<WorkflowToolRunOutcome> {
   try {
+    const target = findStubTarget(input.agentContext.toolStubs, input.toolName);
+    if (target !== undefined) {
+      const result = await callToolStubStep(target.scope, {
+        callId: stubCallId(input.session.id, input.session.turn.id, input.callId),
+        tool: target.tool,
+        input: input.input,
+      });
+      if (result.kind === "error") throw new Error(result.error);
+      if (result.kind === "stub")
+        return { output: toolStubOutput(result.outcome), status: "completed" };
+    }
     const entryPoint = resolveWorkflowEntryPoint<WorkflowCallEntryPoint>(input);
     const result = entryPoint(input.executeInput ?? input.input, ctx);
-    let output: JsonValue;
+    let output: unknown;
     if (!isAsyncIterable(result)) {
       output = await result;
     } else {
@@ -186,13 +201,28 @@ async function executeCallBody(
         await input.owner.send({ from, kind: "report", update: next.value });
         next = await iterator.next();
       }
-      output = (next.value as JsonValue | undefined) ?? last ?? null;
+      output = next.value ?? last;
     }
-    return { output, status: "completed" };
+    return { output: toWorkflowOutput(input, output), status: "completed" };
   } catch (error) {
     if (signals.interrupted) return { output: INTERRUPTED_OUTPUT, status: "completed" };
     return toFailedOutcome(error, signals.runSignal);
   }
+}
+
+/**
+ * An authored result as the run's JSON outcome, parsed the way a local tool's
+ * result is: undefined properties are omitted, a missing result is `null`,
+ * and a value JSON can't carry throws, failing the run.
+ */
+export function toWorkflowOutput(
+  call: { readonly callId: string; readonly toolName: string },
+  output: unknown,
+): JsonValue {
+  return withToolOutputSerializationError(
+    { boundary: "execute", toolCallId: call.callId, toolName: call.toolName },
+    () => parseJsonValue(output ?? null),
+  );
 }
 
 /** A body's failure, or its cancellation when the run stopped. */

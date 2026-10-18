@@ -28,7 +28,9 @@ import {
   importInstalledEnginePackage,
   isEveDevEnvironment,
 } from "#internal/application/optional-package-install.js";
+import { readInstalledPackageVersion } from "#internal/application/optional-package-import.js";
 import { withDevelopmentSandboxTags } from "#execution/sandbox/development-run.js";
+import { SANDBOX_AGENT_ENV } from "#execution/sandbox/session.js";
 import { WORKSPACE_ROOT } from "#runtime/workspace/types.js";
 import type { SandboxNetworkPolicy } from "#shared/sandbox-network-policy.js";
 import type { SandboxProviderHost } from "#shared/sandbox-provider.js";
@@ -238,6 +240,7 @@ export class MicrosandboxVm {
     }
 
     const env = {
+      ...SANDBOX_AGENT_ENV,
       ...this.#input.options.env,
       HOME: MICROSANDBOX_HOME,
       ...createTransformBrokerEnvironment(createMicrosandboxNetworkPlan(this.#networkPolicy)),
@@ -498,6 +501,8 @@ export async function loadMicrosandboxModule(input: {
     }),
   );
 
+  await assertSupportedMicrosandboxApi(module, input.host);
+
   input.log?.("checking microsandbox VM runtime");
   if (!module.isInstalled()) {
     if (!input.options.setup.autoInstall || !isEveDevEnvironment()) {
@@ -515,6 +520,32 @@ export async function loadMicrosandboxModule(input: {
 
   input.log?.("microsandbox runtime ready");
   return module;
+}
+
+/**
+ * microsandbox 0.7 renamed `isInstalled` and removed `setup`. Projects that
+ * already depend on it would otherwise fail every sandbox operation with a
+ * bare `TypeError`.
+ */
+async function assertSupportedMicrosandboxApi(
+  module: MicrosandboxModule,
+  host: SandboxProviderHost,
+): Promise<void> {
+  const loaded = module as Partial<Pick<MicrosandboxModule, "isInstalled" | "setup">>;
+  if (typeof loaded.isInstalled === "function" && typeof loaded.setup === "function") {
+    return;
+  }
+
+  const version = await readInstalledPackageVersion({
+    appRoot: host.resolveProjectPath("."),
+    packageName: MICROSANDBOX_PACKAGE_NAME,
+  }).catch(() => undefined);
+  const installed =
+    version === undefined ? "The installed `microsandbox`" : `\`microsandbox@${version}\``;
+  throw new Error(
+    `${installed} is not supported by eve. Install the supported version with ` +
+      `\`pnpm add -D ${MICROSANDBOX_INSTALL_SPECIFIER}\`, or use DockerSandbox or VercelSandbox instead.`,
+  );
 }
 
 async function withProgressHeartbeat<T>(

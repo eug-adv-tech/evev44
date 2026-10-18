@@ -6,6 +6,21 @@ import type { TokenResult } from "#shared/connection-types.js";
 
 type ApprovalToolInput<TInput> = TInput extends object ? Readonly<TInput> : TInput;
 
+/** Context passed to an approval prompt callback. */
+export interface ApprovalPromptContext<TInput = Record<string, unknown>> {
+  /** Id of the tool call awaiting approval. */
+  readonly callId: string;
+  /** Validated input proposed for the tool call. */
+  readonly input: TInput;
+  /** Final runtime name of the tool. */
+  readonly toolName: string;
+}
+
+/** Builds the human-readable prompt shown when a tool call requires approval. */
+export type ApprovalPrompt<TInput = Record<string, unknown>> = (
+  context: ApprovalPromptContext<TInput>,
+) => string;
+
 /**
  * Context passed to an {@link ApprovalPolicy} function.
  *
@@ -17,8 +32,33 @@ export interface ApprovalContext<TInput = Record<string, unknown>> extends Sessi
   readonly abortSignal: AbortSignal;
   readonly approvedTools: ReadonlySet<string>;
   readonly callId: string;
+  /**
+   * Behavior hints the connection's server declared for this tool, such as
+   * MCP's `readOnlyHint` and `destructiveHint`. Absent for authored tools and
+   * for servers that declare none. Hints are only as trustworthy as the server.
+   */
+  readonly toolAnnotations?: ConnectionToolAnnotations;
   readonly toolInput?: ApprovalToolInput<TInput>;
   readonly toolName: string;
+}
+
+/**
+ * Behavior hints a connection's server declares for one of its tools. The
+ * named fields follow MCP's `ToolAnnotations`; other keys pass through as the
+ * server sent them.
+ */
+export interface ConnectionToolAnnotations {
+  /** Human-readable tool title. */
+  readonly title?: string;
+  /** The tool does not modify its environment. */
+  readonly readOnlyHint?: boolean;
+  /** The tool may perform destructive updates. Meaningful only when not read-only. */
+  readonly destructiveHint?: boolean;
+  /** Repeating a call with the same arguments has no additional effect. */
+  readonly idempotentHint?: boolean;
+  /** The tool may interact with an open world of external entities. */
+  readonly openWorldHint?: boolean;
+  readonly [key: string]: unknown;
 }
 
 /** Request-time approval decision returned by an {@link ApprovalPolicy}. */
@@ -109,6 +149,19 @@ export interface ApprovalConfiguration<TInput = Record<string, unknown>> {
 export type Approval<TInput = Record<string, unknown>> =
   | ApprovalPolicy<TInput>
   | ApprovalConfiguration<TInput>;
+
+/** Approval configuration for a tool, including its optional presentation prompt. */
+export interface ToolApprovalConfiguration<
+  TInput = Record<string, unknown>,
+> extends ApprovalConfiguration<TInput> {
+  /** Optional human-readable prompt shown when this tool requires approval. */
+  readonly prompt?: ApprovalPrompt<TInput>;
+}
+
+/** Approval definition used by authored tools. */
+export type ToolApproval<TInput = Record<string, unknown>> =
+  | ApprovalPolicy<TInput>
+  | ToolApprovalConfiguration<TInput>;
 
 /** Returns the request-time policy from either approval authoring shape. */
 export function resolveApprovalPolicy<TInput>(approval: Approval<TInput>): ApprovalPolicy<TInput> {

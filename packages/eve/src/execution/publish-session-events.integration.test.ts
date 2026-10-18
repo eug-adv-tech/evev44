@@ -1,13 +1,21 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
-import { replaceDurableSessionSnapshot } from "#execution/durable-session-store.js";
-import { emitWorkflowToolRunReportStep } from "#execution/tools/workflow/emit-workflow-tool-run-report-step.js";
+import { readTurnState } from "#harness/session-machine/state.js";
+
+import { sandboxProvider } from "#context/providers/sandbox.js";
+import {
+  readDurableSession,
+  replaceDurableSessionSnapshot,
+} from "#execution/durable-session-store.js";
+import { commitSessionStep } from "#execution/publish-session-events.js";
+import { applyRunMessagesStep } from "#execution/tools/workflow/apply-run-messages-step.js";
 import { withdrawWorkflowToolRunQuestionStep } from "#execution/tools/workflow/withdraw-step.js";
-import { upsertProxyInputRequests } from "#harness/proxy-input-requests.js";
+
 import type { HarnessSession } from "#harness/types.js";
 import { createTestRuntime } from "#internal/testing/app-harness.js";
 import { createTestSessionState } from "#internal/testing/session-state.js";
-import type { MessageStreamEvent } from "#protocol/message.js";
+import { createInputRequestedEvent, type MessageStreamEvent } from "#protocol/message.js";
+import { withPublished, withRelays } from "#internal/testing/session-machine.js";
 import { defineHook } from "#public/definitions/hook.js";
 import { createBundledRuntimeCompiledArtifactsSource } from "#runtime/compiled-artifacts-source.js";
 
@@ -54,20 +62,25 @@ it("publishes a session step's action.partial to the stream and its hooks", asyn
   const { hooked, runtime, sessionWritable, streamed } = await createPublishingRuntime();
 
   await runtime.run(async () => {
-    await emitWorkflowToolRunReportStep({
-      from: {
-        callId: "call-1",
-        input: {},
-        runId: "run-1",
-        sequence: 1,
-        stepIndex: 0,
-        toolName: "research",
-        turnId: "turn-1",
-      },
+    await applyRunMessagesStep({
+      messages: [
+        {
+          from: {
+            callId: "call-1",
+            input: {},
+            runId: "run-1",
+            sequence: 1,
+            stepIndex: 0,
+            toolName: "research",
+            turnId: "turn-1",
+          },
+          kind: "report",
+          update: { progress: "halfway" },
+        },
+      ],
       serializedContext,
       sessionState: createTestSessionState(),
       sessionWritable,
-      update: { progress: "halfway" },
     });
   });
 
@@ -83,22 +96,40 @@ it("publishes a session step's action.partial to the stream and its hooks", asyn
 it("relays a withdrawn workflow question's input.resolved to the stream and its hooks", async () => {
   const { hooked, runtime, sessionWritable, streamed } = await createPublishingRuntime();
   const base = createTestSessionState();
-  const asked = upsertProxyInputRequests({
-    entries: [
-      [
-        "ask-1",
-        {
-          workflowAsk: { control: "control", question: {} },
-          runId: "run-1",
-          childContinuationToken: "ask-1",
-          event: { sequence: 1, stepIndex: 0, turnId: "turn-1" },
-          kind: "question",
-        },
+  const asked = withRelays(
+    withPublished(base.snapshot.session as HarnessSession, [
+      createInputRequestedEvent({
+        callId: "call-1",
+        requests: [
+          {
+            action: { callId: "call-1", input: {}, kind: "tool-call", toolName: "research" },
+            kind: "question",
+            prompt: "Which region should Alice's report cover?",
+            requestId: "ask-1",
+          },
+        ],
+        sequence: 1,
+        stepIndex: 0,
+        turnId: "turn-1",
+      }),
+    ]),
+    {
+      entries: [
+        [
+          "ask-1",
+          {
+            workflowAsk: { control: "control" },
+            reply: {},
+            runId: "run-1",
+            childContinuationToken: "ask-1",
+            event: { sequence: 1, stepIndex: 0, turnId: "turn-1" },
+            kind: "question",
+          },
+        ],
       ],
-    ],
-    forChildContinuationToken: "ask-1",
-    session: base.snapshot.session as HarnessSession,
-  });
+      forChildContinuationToken: "ask-1",
+    },
+  );
 
   await runtime.run(async () => {
     await withdrawWorkflowToolRunQuestionStep({
@@ -121,4 +152,28 @@ it("relays a withdrawn workflow question's input.resolved to the stream and its 
     }),
   ]);
   expect(hooked).toEqual([{ event: streamed[0], sessionId: "test-session" }]);
+});
+
+it("keeps what the sandbox provider commits when a session step saves a transition", async () => {
+  const { runtime, sessionWritable } = await createPublishingRuntime();
+  const captured = { session: null, snapshot: "captured-in-scope" };
+  const commit = vi
+    .spyOn(sandboxProvider, "commit")
+    .mockImplementation(async (_access, session) => ({ ...session, sandboxState: captured }));
+  try {
+    const published = await runtime.run(() =>
+      commitSessionStep(
+        { serializedContext, sessionState: createTestSessionState(), sessionWritable },
+        (view) => [{ events: [], turn: { ...view.turn, grants: ["deploy"] } }],
+        { origin: "relayed" },
+      ),
+    );
+    expect(commit).toHaveBeenCalled();
+    expect(published.sessionState.snapshot.session.sandboxState).toEqual(captured);
+    expect(readTurnState(readDurableSession(published.sessionState).state).grants).toEqual([
+      "deploy",
+    ]);
+  } finally {
+    commit.mockRestore();
+  }
 });

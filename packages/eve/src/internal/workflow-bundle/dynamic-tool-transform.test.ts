@@ -124,6 +124,7 @@ export default defineDynamic({
       const resultPrefix = "Deployed to";
       const updateSuffix = " sources";
       const requestReason = "confirm";
+      const promptPrefix = "Review";
       const allowedResponder = "user-123";
       const projectionPrefix = "visible";
       return {
@@ -144,6 +145,9 @@ export default defineDynamic({
           approval: {
             request(ctx) {
               return ctx.toolInput.force ? { type: "user-approval", reason: requestReason } : "not-applicable";
+            },
+            prompt(ctx) {
+              return promptPrefix + " " + ctx.input.value;
             },
             response(ctx) {
               return ctx.response.principal.principalId === allowedResponder
@@ -172,6 +176,7 @@ export default defineDynamic({
     expect(Object.keys(callbacks)).toEqual([
       "execute",
       "label",
+      "approvalPrompt",
       "approvalRequest",
       "approvalResponse",
       "toModelOutput",
@@ -181,6 +186,7 @@ export default defineDynamic({
     expect(callbacks.label?.complete?.closure).toEqual({ resultPrefix: "Deployed to" });
     expect(callbacks.label?.delta?.closure).toEqual({ updateSuffix: " sources" });
     expect(callbacks.approvalRequest!.closure).toEqual({ requestReason: "confirm" });
+    expect(callbacks.approvalPrompt!.closure).toEqual({ promptPrefix: "Review" });
     expect(callbacks.approvalResponse!.closure).toEqual({ allowedResponder: "user-123" });
     expect(callbacks.toModelOutput!.closure).toEqual({ projectionPrefix: "visible" });
     const callbackValues = [
@@ -189,10 +195,11 @@ export default defineDynamic({
       callbacks.label?.complete,
       callbacks.label?.delta,
       callbacks.approvalRequest,
+      callbacks.approvalPrompt,
       callbacks.approvalResponse,
       callbacks.toModelOutput,
     ];
-    expect(new Set(callbackValues.map((callback) => callback!.callback)).size).toBe(7);
+    expect(new Set(callbackValues.map((callback) => callback!.callback)).size).toBe(8);
     for (const callback of callbackValues) expect(callback!.callback).toBeTypeOf("function");
   });
 
@@ -564,6 +571,51 @@ export default defineDynamic({
     expect(execute({ value: "present" })).toBe("present");
   });
 
+  // https://github.com/vercel/eve/issues/4860
+  it("captures locals bound by an array rest element", async () => {
+    const { callHandler } = await transformAndEval(
+      "tools/array-rest.ts",
+      `
+      import { defineDynamic, defineTool } from "eve/tools";
+      import { z } from "zod";
+      export default defineDynamic({ events: { "turn.started": () => {
+        const [first, ...rest] = ["a", "b"];
+        return { pick: defineTool({
+          description: "Pick",
+          inputSchema: z.object({ pick: z.enum([first, ...rest]) }),
+          execute: ({ pick }) => pick,
+        }) };
+      } } });
+    `,
+    );
+    const { inputSchema } = durableCallbacks((await callHandler()).pick);
+    expect(inputSchema!.closure).toEqual({ first: "a", rest: ["b"] });
+    const schema = inputSchema!.callback(JSON.parse(JSON.stringify(inputSchema!.closure)));
+    if (!isToolSchema(schema)) throw new Error("Expected schema");
+    expect(await schema["~standard"].validate({ pick: "b" })).toEqual({ value: { pick: "b" } });
+  });
+
+  // https://github.com/vercel/eve/issues/4860
+  it("captures a rest parameter of the resolver", async () => {
+    const { callHandler } = await transformAndEval(
+      "tools/rest-param.ts",
+      `
+      import { defineDynamic, defineTool } from "eve/tools";
+      export default defineDynamic({ events: { "turn.started": (...args) => ({
+        count: defineTool({
+          description: "Count",
+          inputSchema: { type: "object" },
+          execute: () => args.length,
+        }),
+      }) } });
+    `,
+    );
+    const tool = (await callHandler()).count as Record<string, unknown>;
+    const { execute } = durableCallbacks(tool);
+    expect(execute!.closure.args).toHaveLength(2);
+    expect(execute!.callback(JSON.parse(JSON.stringify(execute!.closure)), {})).toBe(2);
+  });
+
   it("captures a direct identifier in an arrow expression body", async () => {
     const source = `
 import { defineDynamic, defineTool } from "eve/tools";
@@ -624,8 +676,9 @@ export default defineDynamic({
     const result = await transformDynamicToolExecute("tools/typescript-expressions.ts", source);
 
     expect(result).not.toBeNull();
-    expect(result!.code).toContain("const { asserted, nonNull, satisfied } = __vars");
-    expect(result!.code).not.toContain("const { TypeName, asserted, nonNull, satisfied } = __vars");
+    expect(result!.code).toContain(
+      "function __eve_dynamic_exec_0({ asserted, nonNull, satisfied })",
+    );
   });
 
   it("async execute preserves await semantics", async () => {
@@ -1328,6 +1381,64 @@ export default defineDynamic({
 
     // The inner `name` ("inner") should shadow the outer `name` ("outer")
     expect(execFn()).toBe("inner");
+  });
+
+  it("callback bindings that shadow an enclosing name are not captured", async () => {
+    // Minifiers reuse short names, so a destructured callback parameter or a
+    // callback-local declaration can shadow a binding the tool captures.
+    const source = `
+import { defineDynamic, defineTool } from "eve/tools";
+
+function makeTool(e) {
+  return defineTool({
+    description: "T",
+    inputSchema: { type: "object" },
+    approval: ({ toolInput: e }) => (e?.value === "secret" ? "user-approval" : "not-applicable"),
+    toModelOutput(output) { const e = "local"; return { type: "text", value: e + output }; },
+    execute({ value }) { return e() + ":" + value; },
+  });
+}
+
+export default defineDynamic({
+  events: { "session.started": async () => ({ tool: makeTool(() => "echo") }) },
+});
+`;
+
+    const { callHandler } = await transformAndEval("tools/shadow-pattern.ts", source);
+    const tool = (await callHandler()).tool as Record<string, Function>;
+    const callbacks = durableCallbacks(tool);
+
+    expect(tool.approval!({ toolInput: { value: "secret" } })).toBe("user-approval");
+    expect(tool.toModelOutput!("!")).toEqual({ type: "text", value: "local!" });
+    expect(tool.execute!({ value: "hi" })).toBe("echo:hi");
+    expect(callbacks.approvalRequest!.closure).toEqual({});
+    expect(callbacks.toModelOutput!.closure).toEqual({});
+    expect(Object.keys(callbacks.execute!.closure)).toEqual(["e"]);
+  });
+
+  it("callback parameter defaults can read captured names", async () => {
+    const source = `
+import { defineDynamic, defineTool } from "eve/tools";
+
+function makeTool(fallback) {
+  return defineTool({
+    description: "T",
+    inputSchema: { type: "object" },
+    execute({ limit = fallback }) { return limit; },
+  });
+}
+
+export default defineDynamic({
+  events: { "session.started": async () => ({ tool: makeTool(10) }) },
+});
+`;
+
+    const { callHandler } = await transformAndEval("tools/default-capture.ts", source);
+    const tool = (await callHandler()).tool as Record<string, Function>;
+
+    expect(tool.execute!({})).toBe(10);
+    expect(tool.execute!({ limit: 3 })).toBe(3);
+    expect(durableCallbacks(tool).execute!.closure).toEqual({ fallback: 10 });
   });
 
   it("resolver ctx values are captured separately from execute ctx", async () => {
@@ -2227,7 +2338,7 @@ export default defineDynamic({
     expect(result).not.toBeNull();
     const code = result!.code;
 
-    const destructureMatch = code.match(/const \{([^}]+)\} = __vars/);
+    const destructureMatch = code.match(/function __eve_dynamic_exec_\d+\(\{([^}]+)\}/);
     expect(destructureMatch).not.toBeNull();
     const captured = destructureMatch![1]!.split(",").map((s) => s.trim());
 
@@ -2238,50 +2349,6 @@ export default defineDynamic({
     expect(captured).not.toContain("unused");
     expect(captured).not.toContain("event");
     expect(captured).not.toContain("ctx");
-  });
-
-  it("no duplicate __vars bindings when execute has no overlapping params", async () => {
-    const source = `
-import { defineDynamic, defineTool } from "eve/tools";
-
-export default defineDynamic({
-  events: {
-    "session.started": async (event, ctx) => {
-      const value = 42;
-      return {
-        tool: defineTool({
-          description: "T",
-          inputSchema: {},
-          execute(input) { return value + input.x; },
-        }),
-      };
-    },
-  },
-});
-`;
-
-    const result = await transformDynamicToolExecute("tools/nobinding.ts", source);
-    expect(result).not.toBeNull();
-    const code = result!.code;
-
-    // The hoisted function signature should be: __vars, input
-    // The body should destructure: const { event, ctx, value } = __vars
-    // There must be no name collision between `input` (param) and the
-    // destructured vars
-    const fnMatch = code.match(
-      /function __eve_dynamic_exec_\d+\(([^)]+)\)\s*\{\s*\n\s*const \{([^}]+)\} = __vars/,
-    );
-    expect(fnMatch).not.toBeNull();
-
-    const params = fnMatch![1]!
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s !== "__vars");
-    const destructured = fnMatch![2]!.split(",").map((s) => s.trim());
-
-    // No name should appear in both
-    const overlap = params.filter((p) => destructured.includes(p));
-    expect(overlap).toEqual([]);
   });
 
   it("handles defineDynamic with single-tool return", async () => {
@@ -2361,7 +2428,7 @@ export default defineDynamic({
 
     // The for-of variable `item` should be captured
     const code = result!.code;
-    const destructureMatch = code.match(/const \{([^}]+)\} = __vars/);
+    const destructureMatch = code.match(/function __eve_dynamic_exec_\d+\(\{([^}]+)\}/);
     expect(destructureMatch).not.toBeNull();
     const captured = destructureMatch![1]!.split(",").map((s) => s.trim());
     expect(captured).toContain("item");
@@ -2464,7 +2531,7 @@ export default defineDynamic({
     expect(result).not.toBeNull();
     const code = result!.code;
 
-    expect(code).toContain("const { tag } = __vars");
+    expect(code).toMatch(/function __eve_dynamic_exec_\d+\(\{ tag \}, _input/);
     expect(code).toMatch(/\(\.\.\.__args\) => __eve_dynamic_exec_\d+\(\{ tag \}, \.\.\.__args\)/);
   });
 });

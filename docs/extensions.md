@@ -178,7 +178,7 @@ A mount gives the extension's contributions a namespace. Updating the package up
 
 ### Install the package
 
-Install the extension with the package manager already used by the consumer's agent project. Fresh eve projects use pnpm:
+Install the extension with the package manager already used by the consumer's agent project. For example, in a pnpm project:
 
 ```bash
 pnpm add @acme/crm
@@ -198,6 +198,8 @@ Set `CRM_API_KEY` in the consumer's environment, such as `.env.local` for local 
 
 The mount adds `crm__` to named contributions: `tools/search.ts` becomes `crm__search`, `channels/webhook.ts` becomes `crm__webhook`, `schedules/sync.ts` becomes `crm__sync`, `connections/api.ts` becomes `crm__api`, and `subagents/reviewer/` becomes `crm__reviewer`. Channels keep their declared route paths, and schedules keep their cron expressions.
 
+Do not mount an extension under the name of one of the agent's connections. A [connection owns](/docs/connections) every name that starts with `<name>__`, so the compiler rejects the mounted tools and subagents. Nor can a mount be named `eve`: eve reserves that namespace for its [built-in tools](/docs/concepts/built-in-tools#eve__search-eve__tool-and-eve__skill).
+
 For an extension with no configuration, mount its default export directly:
 
 ```ts title="agent/extensions/gizmo.ts"
@@ -210,11 +212,13 @@ Extension state belongs to the logical mount path (for example, `extensions/crm`
 
 ### Upgrade from package-scoped extension state
 
-Deployments before eve 0.69 stored extension state under package-prefixed keys, such as `acme-crm.requests`. When a session from one of those deployments hands off to a newer deployment, eve moves each package-prefixed value to the mount that uses that package. eve never resets that state during restore.
+Deployments before eve 0.69 stored extension state under package-prefixed keys, such as `acme-crm.requests`. When a session from one of those deployments hands off to a newer deployment, eve moves each package-prefixed value to the mount that uses that package.
 
-- The value moves only when exactly one mount uses the package and the extension still defines that state name. Otherwise eve cannot tell which mount owns the value, so the handoff is rejected and the session stays on its current deployment. Keep that deployment available until the session finishes, or start a new session on the deployment you want to use.
+- The value moves when exactly one mount of that package defines that state name.
+- When no mount of that package defines that state name, for example because the extension removed it or the package was renamed, eve drops the value. The target deployment's runtime logs show a `dropping unknown context key during deserialization` warning with the key.
+- When two or more mounts use the package and define that state name, eve cannot tell which mount owns the value, so the handoff is rejected and the session stays on its current deployment. Keep that deployment available until the session finishes, or start a new session on the deployment you want to use.
 - Older deployments cannot read sessions saved by a newer release, so a session that already moved does not hand back after a rollback.
-- Local context snapshots follow the same rule: an older snapshot restores when every saved state key still has an owner.
+- Local context snapshots follow the same rules.
 
 ### Use an extension in a workspace
 
@@ -355,7 +359,7 @@ export default defineHook({
 });
 ```
 
-`toolResultFrom` recognizes the mounted `crm__search` result from the original definition, not the namespaced string. Publishers should keep tool descriptions distinct so eve can assign each definition an unambiguous identity.
+`toolResultFrom` recognizes the mounted `crm__search` result from the original definition, not the namespaced string. Publishers should keep descriptions distinct across different tool definitions so eve can assign each definition an unambiguous identity. Re-exporting the same definition, such as from a subagent's `tools/` directory, does not conflict.
 
 ### Bundled development extensions
 
@@ -368,6 +372,7 @@ At build time, eve checks the extension's generated capability metadata. If the 
 ## What to read next
 
 - [Integrations](/integrations): browse ready-to-install extensions using the Extensions filter
+- [Code extension](/docs/code-extension): mount eve-code, the coding extension that ships in `eve`, and see its benchmark results
 - [Tools](/docs/tools): static tools, approval, and tool output
 - [Dynamic capabilities](/docs/guides/dynamic-capabilities): dynamic connections, tools, skills, and instructions
 - [Instructions](/docs/instructions): static and TypeScript instructions

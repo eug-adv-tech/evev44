@@ -312,7 +312,8 @@ export function normalizeExternalDependencies(
   return [...new Set(externalDependencies)].sort();
 }
 
-function resolveConfiguredExternalDependency(
+/** Returns the configured external that `source` imports (the entry itself or one of its subpaths). */
+export function resolveConfiguredExternalDependency(
   source: string,
   externalDependencies: readonly string[],
 ): string | undefined {
@@ -321,7 +322,8 @@ function resolveConfiguredExternalDependency(
   );
 }
 
-function packageImportName(source: string): string {
+/** Returns the package part of a bare specifier: `@acme/db/x` → `@acme/db`, `pg/native` → `pg`. */
+export function packageImportName(source: string): string {
   return source.startsWith("@") ? source.split("/", 2).join("/") : source.split("/", 1)[0]!;
 }
 
@@ -409,9 +411,15 @@ export function isPathImport(source: string): boolean {
   return source.startsWith(".") || source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source);
 }
 
+const SELF_MODIFICATION_MOUNT_SPECIFIERS = new Set([
+  "eve/self-modification",
+  "eve/self-modification/local",
+  "eve/self-modification/remote",
+]);
+
 function isFrameworkRuntimeImport(source: string, importer: string | undefined): boolean {
-  // The packaged extension is authored code: its mount and child must share a scoped handle.
-  if (source === "eve/self-modification") return false;
+  // Packaged extension mounts are authored code: each mount and its child must share a scoped handle.
+  if (SELF_MODIFICATION_MOUNT_SPECIFIERS.has(source)) return false;
   if (source === "eve" || source.startsWith("eve/")) {
     return true;
   }

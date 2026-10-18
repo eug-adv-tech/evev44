@@ -1,6 +1,7 @@
 "use client";
 
 import { track } from "@vercel/analytics";
+import { Badge } from "@vercel/geistdocs/components/badge";
 import { Button } from "@vercel/geistdocs/components/button";
 import {
   DropdownMenu,
@@ -37,7 +38,7 @@ interface TemplateGalleryProps {
 
 type TemplateGalleryEntry = Pick<
   TemplateManifestEntry,
-  "category" | "description" | "integrations" | "slug" | "title"
+  "category" | "description" | "featured" | "integrations" | "slug" | "title"
 >;
 
 interface FilterSelectProps<T extends string> {
@@ -60,10 +61,10 @@ const FilterSelect = <T extends string>({
       <Button
         aria-label={label}
         className="h-11 w-full justify-between px-3 md:h-9 md:w-44"
-        variant="outline"
+        suffix={<ChevronDownIcon aria-hidden="true" className="size-3.5 text-gray-800" />}
+        variant="secondary"
       >
-        <span className="truncate">{value === ALL ? allLabel : value}</span>
-        <ChevronDownIcon aria-hidden="true" className="size-3.5 text-gray-800" />
+        {value === ALL ? allLabel : value}
       </Button>
     </DropdownMenuTrigger>
     <DropdownMenuContent align="start" className="w-[var(--radix-dropdown-menu-trigger-width)]">
@@ -95,13 +96,20 @@ const TemplateCard = ({
 }) => (
   <li>
     <Link
-      className="flex min-h-36 flex-col rounded-lg border border-gray-alpha-400 bg-background-100 p-4 no-underline outline-none transition-colors hover:border-gray-alpha-500 hover:bg-gray-alpha-100 focus-visible:border-gray-alpha-600 focus-visible:ring-2 focus-visible:ring-blue-700 focus-visible:ring-offset-2 focus-visible:ring-offset-background-100 motion-reduce:transition-none"
+      className="flex h-full min-h-36 flex-col rounded-lg border border-gray-alpha-400 bg-background-100 p-4 no-underline outline-none transition-colors hover:border-gray-alpha-500 hover:bg-gray-alpha-100 focus-visible:border-gray-alpha-600 focus-visible:ring-2 focus-visible:ring-blue-700 focus-visible:ring-offset-2 focus-visible:ring-offset-background-100 motion-reduce:transition-none"
       href={templatePath(entry.slug)}
       onClick={onSelect}
       prefetch={true}
     >
-      <h2 className="text-gray-1000 text-heading-16">{entry.title}</h2>
-      <p className="mt-2 line-clamp-2 max-w-[90%] text-balance text-[14px] leading-[1.3] text-gray-800">
+      <div className="flex items-start justify-between gap-3">
+        <h3 className="min-w-0 text-gray-1000 text-heading-16">{entry.title}</h3>
+        {entry.featured ? (
+          <Badge className="shrink-0" variant="blue">
+            Featured
+          </Badge>
+        ) : null}
+      </div>
+      <p className="mt-2 line-clamp-3 max-w-[90%] text-balance text-[14px] leading-[1.3] text-gray-800">
         {entry.description}
       </p>
       <ul aria-label="Integrations" className="mt-auto flex items-center gap-2 pt-4">
@@ -167,6 +175,9 @@ export const TemplateGallery = ({ entries }: TemplateGalleryProps) => {
     });
   }, [category, entries, integration, query]);
 
+  const featuredResults = results.filter((entry) => entry.featured);
+  const otherResults = results.filter((entry) => !entry.featured);
+
   useEffect(() => {
     const normalizedQuery = normalizeSearchQuery(query);
     if (!normalizedQuery) {
@@ -194,20 +205,17 @@ export const TemplateGallery = ({ entries }: TemplateGalleryProps) => {
   return (
     <section aria-label="Templates" className="flex flex-col gap-6">
       <div className="flex flex-col gap-2 md:flex-row">
-        <div className="relative min-w-0 flex-1">
-          <SearchIcon
-            aria-hidden="true"
-            className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-gray-800"
-          />
-          <Input
-            aria-label="Search templates"
-            className="h-11 pr-4 pl-9 text-copy-14 md:h-9"
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search templates and examples…"
-            type="search"
-            value={query}
-          />
-        </div>
+        <Input
+          aria-label="Search templates"
+          className="h-11 md:h-9 [&_input]:h-full [&_input]:pl-2"
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search templates and examples…"
+          prefix={<SearchIcon aria-hidden="true" className="ml-3 size-4 text-gray-800" />}
+          prefixStyling={false}
+          typeName="search"
+          value={query}
+          wrapperClassName="min-w-0 flex-1"
+        />
         <div className="grid grid-cols-2 gap-2 md:flex md:shrink-0">
           <FilterSelect
             allLabel="All categories"
@@ -240,22 +248,40 @@ export const TemplateGallery = ({ entries }: TemplateGalleryProps) => {
 
       <div aria-live="polite">
         {results.length > 0 ? (
-          <ul className="grid list-none gap-4 p-0 sm:grid-cols-2 lg:grid-cols-3">
-            {results.map((entry) => (
-              <TemplateCard
-                entry={entry}
-                key={entry.title}
-                onSelect={() =>
-                  track(analyticsEvents.templateOpened, {
-                    category,
-                    integration,
-                    search: query.trim().length > 0,
-                    template: entry.slug,
-                  })
-                }
-              />
-            ))}
-          </ul>
+          <div className="flex flex-col gap-10">
+            {[
+              { id: "featured-templates", title: "Featured", entries: featuredResults },
+              {
+                id: "other-templates",
+                title: featuredResults.length > 0 ? "More templates" : "Templates",
+                entries: otherResults,
+              },
+            ]
+              .filter((group) => group.entries.length > 0)
+              .map((group) => (
+                <section aria-labelledby={group.id} key={group.id}>
+                  <h2 className="mb-4 text-heading-20 text-gray-1000" id={group.id}>
+                    {group.title}
+                  </h2>
+                  <ul className="grid list-none gap-4 p-0 sm:grid-cols-2 lg:grid-cols-3">
+                    {group.entries.map((entry) => (
+                      <TemplateCard
+                        entry={entry}
+                        key={entry.slug}
+                        onSelect={() =>
+                          track(analyticsEvents.templateOpened, {
+                            category,
+                            integration,
+                            search: query.trim().length > 0,
+                            template: entry.slug,
+                          })
+                        }
+                      />
+                    ))}
+                  </ul>
+                </section>
+              ))}
+          </div>
         ) : (
           <div className="flex min-h-48 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-gray-alpha-400 px-6 text-center">
             <p className="text-heading-16 text-gray-1000">No matching entries</p>

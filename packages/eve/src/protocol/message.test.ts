@@ -112,6 +112,43 @@ describe("message stream protocol", () => {
     });
   });
 
+  it("names skill loads that eve 0.75 recorded only by their load_skill input", () => {
+    // Parsed like a stored line: its `load-skill` action has no `name`.
+    const released = JSON.parse(
+      JSON.stringify({
+        data: {
+          actions: [
+            { callId: "call_skill", input: { skill: "pdf-forms" }, kind: "load-skill" },
+            { callId: "call_tool", input: {}, kind: "tool-call", toolName: "lookup" },
+          ],
+          sequence: 2,
+          stepIndex: 0,
+          turnId: "turn_1",
+        },
+        meta: { at: "2026-10-01T00:00:00.000Z", id: "evt_released_skill" },
+        type: "actions.requested",
+      }),
+    ) as MessageStreamEventForVersion<"26">;
+    const named = {
+      ...released,
+      data: {
+        ...released.data,
+        actions: [
+          {
+            callId: "call_skill",
+            input: { skill: "pdf-forms" },
+            kind: "load-skill",
+            name: "pdf-forms",
+          },
+          { callId: "call_tool", input: {}, kind: "tool-call", toolName: "lookup" },
+        ],
+      },
+    };
+
+    expect(normalizeMessageStreamEvent("26", released)).toEqual(named);
+    expect(normalizePersistedMessageStreamEvent(released)).toEqual(named);
+  });
+
   it("strips repeated v24 zero offsets without adding stream markers", () => {
     const normalize = (inputTextDelta: string) => {
       const event = normalizeMessageStreamEvent("24", {
@@ -489,6 +526,7 @@ describe("message stream protocol", () => {
     const event = createActionResultEvent({
       result: {
         callId: "call_weather",
+        isError: true,
         kind: "tool-result",
         output: '{"code":"TOOL_EXECUTION_FAILED","message":"Nope"}',
         toolName: "get_weather",
@@ -505,6 +543,7 @@ describe("message stream protocol", () => {
       },
       result: {
         callId: "call_weather",
+        isError: true,
         kind: "tool-result",
         output: '{"code":"TOOL_EXECUTION_FAILED","message":"Nope"}',
         toolName: "get_weather",
@@ -514,6 +553,46 @@ describe("message stream protocol", () => {
       stepIndex: 1,
       turnId: "turn_0",
     });
+  });
+
+  it("preserves the failed wire status for an automatic policy denial", () => {
+    const event = createActionResultEvent({
+      result: {
+        callId: "call_1",
+        isError: true,
+        kind: "tool-result",
+        output: { code: "TOOL_EXECUTION_DENIED", message: "Tool execution was denied." },
+        toolName: "deploy",
+      },
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn_0",
+    });
+    expect(event.data).toMatchObject({
+      error: { code: "TOOL_EXECUTION_DENIED" },
+      status: "failed",
+    });
+  });
+
+  it("keeps successful action results completed when their output has code and message fields", () => {
+    const event = createActionResultEvent({
+      result: {
+        callId: "call_purchase_request",
+        kind: "tool-result",
+        output: {
+          code: "PR-2025-001",
+          message: "Purchase request created successfully.",
+          ok: true,
+        },
+        toolName: "create_purchase_request",
+      },
+      sequence: 0,
+      stepIndex: 1,
+      turnId: "turn_0",
+    });
+
+    expect(event.data.status).toBe("completed");
+    expect(event.data.error).toBeUndefined();
   });
 
   it("marks denied action results as rejected", () => {
@@ -615,17 +694,16 @@ describe("createMessageReceivedEvent", () => {
     ]);
   });
 
-  it("exposes data URLs but not opaque base64 strings", () => {
-    const dataUrl = "data:text/plain;base64,aGVsbG8=";
-
-    expect(projectParts([{ data: dataUrl, mediaType: "text/plain", type: "file" }])).toEqual([
-      { mediaType: "text/plain", type: "file", url: dataUrl },
-    ]);
+  it("projects data URLs and base64 strings as their size, never their bytes", () => {
     expect(
       projectParts([
+        { data: "data:text/plain;base64,aGVsbG8=", mediaType: "text/plain", type: "file" },
         { data: "aGVsbG8=", filename: "note.txt", mediaType: "text/plain", type: "file" },
       ]),
-    ).toEqual([{ filename: "note.txt", mediaType: "text/plain", type: "file" }]);
+    ).toEqual([
+      { mediaType: "text/plain", size: 5, type: "file" },
+      { filename: "note.txt", mediaType: "text/plain", size: 5, type: "file" },
+    ]);
   });
 
   it("exposes tagged URL file data", () => {

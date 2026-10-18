@@ -1,4 +1,5 @@
 import type { ConnectionSourceRef } from "#discover/manifest.js";
+import { eveNamespaceReservation } from "#protocol/runtime-tools.js";
 import {
   normalizeMcpClientConnectionDefinition,
   normalizeOpenApiConnectionDefinition,
@@ -82,6 +83,14 @@ export async function compileConnectionDefinition(
     };
   }
 
+  // A connection's own name is the entry that signs the user in to it.
+  const reservation = eveNamespaceReservation(source.connectionName);
+  if (reservation !== undefined) {
+    throw new Error(
+      `Connection "${source.logicalPath}" uses the reserved name "${source.connectionName}". Rename its path; ${reservation}.`,
+    );
+  }
+
   const protocol = readConnectionProtocol(loaded);
 
   const shared = {
@@ -110,6 +119,9 @@ export async function compileConnectionDefinition(
       ...shared,
       description: normalized.description,
       protocol: "mcp",
+      ...(normalized.experimental_events === undefined
+        ? {}
+        : { experimental_events: true as const }),
       url: normalized.url,
     };
     auth = normalized.auth;

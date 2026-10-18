@@ -5,7 +5,6 @@ import {
   isTeamsToolApprovalResponseActivity,
   readTeamsInputReplyToActivityId,
   renderInputRequestMessage,
-  TEAMS_HITL_CHOICE_INPUT_ID,
   TEAMS_HITL_DATA_KEY,
   TEAMS_HITL_FREEFORM_INPUT_ID,
   TEAMS_HITL_PROMPT_KEY,
@@ -48,10 +47,26 @@ describe("Teams HITL helpers", () => {
     });
   });
 
-  it("renders select requests with a ChoiceSet", () => {
-    const body = renderInputRequestMessage({ ...request(), display: "select" });
-    const card = body.attachments?.[0]?.content as { body?: Array<Record<string, unknown>> };
-    expect(card.body?.some((entry) => entry.id === TEAMS_HITL_CHOICE_INPUT_ID)).toBe(true);
+  it("carries the prompt each button submits as the card shows it", () => {
+    const prompt = "x".repeat(20_000);
+    const body = renderInputRequestMessage({
+      ...request(),
+      kind: "question",
+      options: ["a", "b", "c", "d", "e", "f"].map((id) => ({ id, label: id })),
+      prompt,
+      requestId: "REQ",
+    });
+    const card = body.attachments?.[0]?.content as {
+      actions?: Array<{ data?: Record<string, Record<string, unknown>> }>;
+      body?: Array<{ text?: string }>;
+    };
+    const shown = card.body?.[0]?.text;
+
+    expect(shown?.length).toBeLessThan(prompt.length);
+    expect(card.actions).toHaveLength(6);
+    for (const action of card.actions ?? []) {
+      expect(action.data?.[TEAMS_HITL_DATA_KEY]?.[TEAMS_HITL_PROMPT_KEY]).toBe(shown);
+    }
   });
 
   it("decodes message and invoke submission values", () => {

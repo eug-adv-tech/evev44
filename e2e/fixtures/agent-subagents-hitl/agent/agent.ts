@@ -25,6 +25,24 @@ function respond(request: MockModelRequest): MockModelResponse | string {
       ],
     };
   }
+  if (message.includes("Call the release-pair subagent exactly once")) {
+    const result = taskResultOf(request, "release-pair");
+    if (result !== undefined) return `The release-pair subagent returned: ${result}`;
+    if (hasReceipt(request, "release-pair")) return waitForTasks();
+    return {
+      toolCalls: [
+        { input: { message: "Deploy the release and publish its notes." }, name: "release-pair" },
+      ],
+    };
+  }
+  // RELAY-<child>: delegate to that mock child once, wait for it, and report its result.
+  const relay = /RELAY-(question-child|budget-child)/u.exec(message)?.[1];
+  if (relay !== undefined) {
+    const result = taskResultOf(request, relay);
+    if (result !== undefined) return `RELAY-RESULT ${result}`;
+    if (hasReceipt(request, relay)) return waitForTasks();
+    return { toolCalls: [{ input: { message: "Handle Alice's release request." }, name: relay }] };
+  }
   if (message.includes("Call the stock-price subagent exactly once")) {
     const quote = taskResultOf(request, "stock-price");
     if (quote !== undefined) return `The stock-price subagent returned: ${quote}`;
@@ -88,7 +106,7 @@ function hasReceipt(request: MockModelRequest, tool: string): boolean {
 }
 
 function waitForTasks(): MockModelResponse {
-  return { toolCalls: [{ input: {}, name: "task_wait" }] };
+  return { toolCalls: [{ input: {}, name: "eve__task_wait" }] };
 }
 
 export default defineAgent({

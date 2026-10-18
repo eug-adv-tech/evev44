@@ -1,5 +1,6 @@
 import { sessionInboxHookToken } from "#execution/session-inbox/address.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { takeLeadingAppliedRunMessages } from "#execution/session-workflow-tool-run.js";
 
 import {
   createSessionInbox,
@@ -128,6 +129,59 @@ describe("createSessionInbox", () => {
     expect(inbox.drain()).toEqual([]);
     expect(createHookMock).toHaveBeenCalledOnce();
     expect(await inbox.release()).toEqual([]);
+  });
+
+  it("reads a run's relayed messages separately, and takes them a batch's budget at a time", async () => {
+    const from = {
+      callId: "call",
+      input: {},
+      runId: "tool-run",
+      sequence: 0,
+      stepIndex: 0,
+      toolName: "review",
+      turnId: "turn-1",
+    };
+    const opened: SessionInboxPayload = {
+      from,
+      kind: "agent-started",
+      session: {
+        continuationToken: "subagent:child-1",
+        kind: "local",
+        name: "reviewer",
+        nodeId: "reviewer",
+        sessionId: "child-1",
+      },
+    };
+    // Alice's reviewers report long findings, more than one step applies at once.
+    const findings = (label: string): SessionInboxPayload => ({
+      from,
+      kind: "report",
+      update: label.padEnd(40_000, "."),
+    });
+    const batch = {
+      kind: "workflow-batch",
+      messages: [opened, findings("first"), findings("second")],
+    };
+    installHooks(
+      createMockHook({
+        token: "stable",
+        reads: [
+          Promise.resolve(resolved(batch as never)),
+          Promise.resolve(resolved(send("Bob asks how it is going."))),
+        ],
+      }),
+    );
+    const inbox = createSessionInbox("session-1");
+    await inbox.claimSessionHook("stable");
+    await vi.waitFor(() => expect(inbox.hasPending()).toBe(true));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(takeLeadingAppliedRunMessages(inbox)).toEqual([opened, findings("first")]);
+    expect(takeLeadingAppliedRunMessages(inbox)).toEqual([findings("second")]);
+    // Taking run messages from the front stops at Bob's message.
+    expect(takeLeadingAppliedRunMessages(inbox)).toEqual([]);
+    expect(inbox.drain()).toEqual([send("Bob asks how it is going.")]);
+    await inbox.dispose();
   });
 
   it("keeps a pushed cancellation queued for the consumer", async () => {

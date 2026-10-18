@@ -1,13 +1,15 @@
-import type { ModelMessage, ToolSet, TypedToolResult } from "ai";
+import type { ToolSet, TypedToolResult } from "ai";
 
 import { contextStorage } from "#context/container.js";
 import {
   type AuthorizationSignal,
   isAuthorizationSignal,
   isPendingAuthorizationToolOutput,
-  resolveActiveAuthorizationChallenges,
 } from "#harness/authorization.js";
+import { resolveActiveAuthorizationChallenges } from "#harness/hitl/sign-ins.js";
 import { readToolInterrupt } from "#harness/tool-interrupts.js";
+import { createRuntimeToolCallActionFromToolCall } from "#harness/tool-call-action.js";
+import type { RuntimeToolCallActionRequest } from "#shared/action-types.js";
 
 /** Returns whether an inline tool result represents a pending authorization interrupt. */
 export function isInlineAuthorizationToolResult(toolResult: TypedToolResult<ToolSet>): boolean {
@@ -17,36 +19,42 @@ export function isInlineAuthorizationToolResult(toolResult: TypedToolResult<Tool
   );
 }
 
-/**
- * Resolves authorization interrupts and keeps only protocol-complete sibling
- * calls from the response that produced them.
- */
+/** A call a sign-in stopped, as the entry it ran, and the connections it needs. */
+export interface StoppedCall {
+  readonly action: RuntimeToolCallActionRequest;
+  readonly connections: readonly string[];
+}
+
+/** Resolves the authorization interrupts of a run's tool results. */
 export function resolveInlineAuthorizationInterrupt(input: {
-  readonly messages: readonly ModelMessage[];
   readonly toolResults: readonly TypedToolResult<ToolSet>[] | undefined;
 }):
   | {
       readonly challenges: AuthorizationSignal["challenges"];
-      readonly history: ModelMessage[];
+      /** The calls sign-ins stopped, each with the connections it needs. */
+      readonly calls: readonly StoppedCall[];
     }
   | undefined {
   const signals: AuthorizationSignal[] = [];
-  const interruptedCallIds = new Set<string>();
+  const calls: StoppedCall[] = [];
 
   for (const toolResult of input.toolResults ?? []) {
     const signal = readAuthorizationSignal(toolResult);
     if (signal === undefined) continue;
     signals.push(signal);
-    interruptedCallIds.add(toolResult.toolCallId);
+    calls.push({
+      action: createRuntimeToolCallActionFromToolCall({ toolCall: toolResult }),
+      connections: signal.challenges.map((challenge) => challenge.name),
+    });
   }
 
   if (signals.length === 0) return undefined;
 
   return {
+    calls,
     challenges: resolveActiveAuthorizationChallenges(
       signals.flatMap((signal) => signal.challenges),
     ),
-    history: projectCompletedSiblingCalls(input.messages, interruptedCallIds),
   };
 }
 
@@ -57,33 +65,4 @@ function readAuthorizationSignal(
   const stashed = ctx === undefined ? undefined : readToolInterrupt(ctx, toolResult.toolCallId);
   if (stashed !== undefined && isAuthorizationSignal(stashed)) return stashed;
   return isAuthorizationSignal(toolResult.output) ? toolResult.output : undefined;
-}
-
-function projectCompletedSiblingCalls(
-  messages: readonly ModelMessage[],
-  interruptedCallIds: ReadonlySet<string>,
-): ModelMessage[] {
-  const projected = messages.flatMap((message): ModelMessage[] => {
-    if (message.role === "assistant" && Array.isArray(message.content)) {
-      const interrupted = message.content.some(
-        (part) => part.type === "tool-call" && interruptedCallIds.has(part.toolCallId),
-      );
-      const content = message.content.filter(
-        (part) => part.type !== "tool-call" || !interruptedCallIds.has(part.toolCallId),
-      );
-      const hasSiblingCall = content.some((part) => part.type === "tool-call");
-      return content.length === 0 || (interrupted && !hasSiblingCall)
-        ? []
-        : [{ ...message, content }];
-    }
-    if (message.role === "tool") {
-      const content = message.content.filter(
-        (part) => part.type !== "tool-result" || !interruptedCallIds.has(part.toolCallId),
-      );
-      return content.length === 0 ? [] : [{ ...message, content }];
-    }
-    return [message];
-  });
-
-  return projected;
 }

@@ -4,7 +4,8 @@ import type {
   StandardSchemaV1,
 } from "#compiled/@standard-schema/spec/index.js";
 
-import type { Approval } from "#approval/definition.js";
+import type { ToolApproval } from "#approval/definition.js";
+import type { SessionAuthContext } from "#channel/types.js";
 import type { SessionContext } from "#context/session-context.js";
 import { stampDefinitionKey } from "#internal/authored-definition/source-identity.js";
 import type { JsonObject } from "#shared/json.js";
@@ -23,7 +24,10 @@ type ApprovalContextInput<TInput> = unknown extends TInput ? Record<string, unkn
 export type { ToolAuthDefinition, ToolAuthOptions, ToolAuthProvider } from "#tools/auth.js";
 export type { ToolModelOutput, ToolModelOutputPart } from "#tools/model-output.js";
 
-export type ToolExecuteOptions = Omit<ToolExecutionOptions<unknown>, "context">;
+export type ToolExecuteOptions = Omit<ToolExecutionOptions<unknown>, "context"> & {
+  /** Who approved the call, when it runs after a person approved it. */
+  readonly approval?: { readonly responder: SessionAuthContext };
+};
 
 export type ToolExecuteFn<TInput = unknown, TOutput = unknown> = (
   input: TInput,
@@ -33,6 +37,11 @@ export type ToolExecuteFn<TInput = unknown, TOutput = unknown> = (
 interface ToolDefinitionBase {
   /** Whether delegated agent sessions receive this tool. Defaults to `true`. */
   readonly availableInSubagents?: boolean;
+  /**
+   * Keeps this tool out of the model's tool list. The model finds it with
+   * `eve__search` and calls it with `eve__tool`. Defaults to `false`.
+   */
+  readonly deferred?: boolean;
   readonly description: string;
 }
 
@@ -211,7 +220,40 @@ export type ToolContext = SessionContext & {
    * token returned by {@link getToken}.
    */
   requireAuth(provider: ToolAuthProvider, options?: ToolAuthOptions): never;
+  /**
+   * The person who approved this call. Present only when the call runs after a
+   * person approved it; absent for calls that needed no approval.
+   */
+  readonly approval?: ApprovedCall;
 };
+
+/**
+ * The approval behind an approved tool call. The call still runs as the
+ * requester, `ctx.session.auth.current`; this only lets it read who approved
+ * it and act with their credentials where the tool chooses to.
+ */
+export interface ApprovedCall {
+  /** Who approved the call: the same principal its response policy saw. */
+  readonly responder: ApprovalResponder;
+}
+
+/**
+ * The person who approved a call, with access to their own credentials. A
+ * transient object built for each approved call: its identity fields are the
+ * stored responder record, and `getToken` is not serialized with them.
+ */
+export interface ApprovalResponder extends SessionAuthContext {
+  /**
+   * Resolves the responder's token for an inline provider, as
+   * {@link ToolContext.getToken} does for the requester. It never starts a
+   * sign-in: when the responder has no token, it throws a non-retryable
+   * `ConnectionAuthorizationFailedError` with
+   * `reason: "approver_authorization_required"`. It shares the call's
+   * providers with `ctx.getToken`, so two inline providers without provider
+   * metadata need `options.authKey` across both getters too.
+   */
+  getToken(provider: ToolAuthProvider, options?: ToolAuthOptions): Promise<TokenResult>;
+}
 
 /**
  * Public tool definition authored in `agent/tools/*.ts`.
@@ -253,7 +295,7 @@ export interface ToolDefinition<TInput = unknown, TOutput = unknown> extends Pub
    * - {@link never}: never require approval
    * - {@link once}: require approval only the first time per session
    */
-  approval?: Approval<ApprovalContextInput<TInput>>;
+  approval?: ToolApproval<ApprovalContextInput<TInput>>;
   /**
    * Optional projection controlling what the model sees as the tool result.
    * Receives the full `TOutput` from {@link execute} and returns the
@@ -392,7 +434,7 @@ export function stampToolDefinition<
     readonly outputSchema?: unknown;
     readonly execute?: (...args: never[]) => unknown;
     readonly label?: ToolLabelDefinition;
-    readonly approval?: Approval<never>;
+    readonly approval?: ToolApproval<never>;
     readonly approvalKey?: (...args: never[]) => unknown;
     readonly toModelOutput?: (...args: never[]) => unknown;
   },

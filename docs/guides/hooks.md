@@ -97,7 +97,7 @@ when the parent's current model step ends if one is running.
 
 ### Narrowing tool results
 
-`toolResultFrom` narrows an `action.result` event to a specific authored tool or MCP connection and returns typed output. Import it from `eve/tools`:
+`toolResultFrom` narrows an `action.result` event to a specific authored tool or connection (MCP or OpenAPI) and returns typed output. Import it from `eve/tools`:
 
 ```ts
 import { defineHook } from "eve/hooks";
@@ -114,7 +114,7 @@ export default defineHook({
         console.log(weather.output.temperature);
       }
 
-      // MCP connection: output is unknown, toolName is qualified
+      // Connection: output is unknown, toolName is qualified
       const linearResult = toolResultFrom(event.data.result, linear);
       if (linearResult) {
         console.log(linearResult.connectionToolName, linearResult.output);
@@ -134,6 +134,8 @@ import { search } from "@acme/crm/tools";
 // inside "action.result":
 const crmSearch = toolResultFrom(event.data.result, search); // typed; matches crm__search
 ```
+
+When one definition is mounted under more than one tool name, for example when a subagent re-exports an extension tool, `toolResultFrom` matches results from every mounted name.
 
 ### Persist events to your own database
 
@@ -217,6 +219,10 @@ export default defineHook({
 
 The remaining subscribers for the event still run. Then eve cancels the turn the same way [`session.cancel()`](./client/streaming) does: in-flight model and tool work is aborted, delegated child turns are cancelled, and the turn ends with `turn.cancelled` followed by `session.waiting`. No failure event is emitted. A cancel from `turn.started` or `step.started` takes effect before that model call. In a conversation, the next message starts a new turn. A delegated task reports the cancellation to its caller.
 
+A plain-text message that answers a pending question, such as one from `ask_question`, is recorded as `message.received` before eve delivers it. Calling `ctx.cancel()` from that event's hook cancels the turn instead: the question resolves as `cancelled`, and the waiting tool call never receives the text.
+
+The same goes for the `action.partial` a workflow tool reports while the turn waits on it: `ctx.cancel()` from its hook cancels the turn, and the run's result never reaches the model.
+
 `ctx.cancel()` returns `void` rather than a promise. The turn stops after the hook returns, so there is nothing to await. Call it before the handler's promise settles: eve ignores a call from work the handler does not await and logs a warning.
 
 `ctx.cancel()` only stops a running turn. eve logs a warning and ignores the call on `step.failed`, `turn.completed`, `turn.failed`, `turn.cancelled`, `turn.waiting`, `session.waiting`, `session.completed`, `session.failed`, `context.cleared`, `task.started`, `task.settled`, and `agent.started`, and during clear or compact requests.
@@ -225,7 +231,7 @@ The remaining subscribers for the event still run. Then eve cancels the turn the
 
 Subagents may carry their own `agent/hooks/` directory. Subagent hooks fire only inside the subagent scope. Parent-agent hooks do not fire for subagent turns, and subagent hooks see only the subagent's own context.
 
-Interactive events such as `input.requested` and `authorization.required` are also published on the parent stream. Parent hooks observe these events after the parent channel handler and stream write, with the parent's session, agent, and channel context. The event retains the child's turn coordinates, so `event.data.turnId` can differ from `ctx.session.turn.id`. The parent follows a proxied `input.requested` or `authorization.required` with `turn.waiting` for its own open turn, which stays open until the running call finishes. A proxied `authorization.completed` is not followed by a parent turn event. These parent events also invoke parent hooks; they do not resolve pending input requests.
+Interactive events such as `input.requested` and `authorization.required` are also published on the parent stream. Parent hooks observe these events after the parent channel handler and stream write, with the parent's session, agent, and channel context. The event retains the child's turn coordinates, so `event.data.turnId` can differ from `ctx.session.turn.id`. A proxied `input.requested` also carries `event.data.callId`, the parent call that waits on it. The parent follows a proxied `input.requested` or `authorization.required` with `turn.waiting` for its own open turn, which stays open until the running call finishes. A proxied `authorization.completed` is not followed by a parent turn event. These parent events also invoke parent hooks; they do not resolve pending input requests.
 
 ## Hook vs tool vs provider
 

@@ -1,11 +1,13 @@
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, type Mock, vi } from "vitest";
 
 import { buildAdapterContext } from "#channel/adapter-context.js";
 import { callAdapterEventHandler, type ChannelAdapter } from "#channel/adapter.js";
 import { isCompiledChannel, type CompiledChannel } from "#channel/compiled-channel.js";
+import { INACTIVE_REQUEST_NOTICE } from "#channel/inactive-prompt.js";
 import { isHttpRouteDefinition } from "#channel/routes.js";
+import { SessionNotActiveError } from "#channel/session-not-active-error.js";
 import { ContextContainer, contextStorage } from "#context/container.js";
 import { SessionKey } from "#context/keys.js";
 import { mockChannelContext } from "#internal/testing/mocks/mock-channel-operations.js";
@@ -16,6 +18,7 @@ import {
 } from "#public/channels/discord/hitl.js";
 import { defaultDiscordAuth, discordChannel } from "#public/channels/discord/index.js";
 import { captureLogRecords } from "#internal/testing/log-records.js";
+import { mockAgentRouteArgs } from "#internal/testing/mocks/mock-route-args.js";
 
 function asCompiled<T = unknown>(channel: unknown): CompiledChannel<T> {
   if (!isCompiledChannel(channel)) {
@@ -130,9 +133,10 @@ function signedRequest(input: {
 async function firePost(
   channel: unknown,
   request: Request,
+  send: Mock<(...args: any[]) => any> = vi.fn().mockResolvedValue({ id: "s1" }),
 ): Promise<{
   response: Response;
-  send: ReturnType<typeof vi.fn>;
+  send: Mock<(...args: any[]) => any>;
   waitUntil: ReturnType<typeof vi.fn>;
 }> {
   const compiled = asCompiled(channel);
@@ -140,10 +144,10 @@ async function firePost(
   if (!post || !isHttpRouteDefinition(post)) {
     throw new Error("Expected discord channel to define a POST route.");
   }
-  const send = vi.fn().mockResolvedValue({ id: "s1" });
   const waitUntil = vi.fn();
 
   const response = await post.handler(request, {
+    ...mockAgentRouteArgs(),
     attachSession: vi.fn() as any,
     ...mockChannelContext(send),
     to: vi.fn() as any,
@@ -289,41 +293,155 @@ describe("discordChannel() inbound route", () => {
     );
   });
 
-  it("delivers HITL button clicks as inputResponses", async () => {
+  describe("answering a HITL press", () => {
     const { privateKey, publicKeyHex } = testKeys();
-    const components = renderInputRequestComponents({
-      action: { callId: "call_1", input: {}, kind: "tool-call", toolName: "ask_question" },
-      kind: "question",
-      options: [{ id: "approve", label: "Approve" }],
-      prompt: "Approve?",
-      requestId: "call_1",
-    });
-    const customId = (components[0] as { components: Array<{ custom_id: string }> }).components[0]!
-      .custom_id;
-    const body = JSON.stringify({
-      application_id: "APP1",
-      channel_id: "C01",
-      data: { component_type: 2, custom_id: customId },
-      id: "I02",
-      message: { id: "M01" },
-      token: "tok2",
-      type: 3,
-      user: { id: "U01", username: "ada" },
-      version: 1,
-    });
-    const channel = discordChannel({ credentials: { publicKey: publicKeyHex } });
-
-    const { response, send } = await firePost(channel, signedRequest({ body, privateKey }));
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ type: 6 });
-    expect(send).toHaveBeenCalledWith(
-      "C01:M01",
+    const customId = (
+      renderInputRequestComponents({
+        action: { callId: "call_1", input: {}, kind: "tool-call", toolName: "ask_question" },
+        kind: "question",
+        options: [{ id: "approve", label: "Approve" }],
+        prompt: "Approve?",
+        requestId: "call_1",
+      })[0] as { components: Array<{ custom_id: string }> }
+    ).components[0]!.custom_id;
+    /** A press of Approve in guild G01, as Discord sends it: the presser on `member`. */
+    const press = (userId: string, content: string | null = "Approve?") =>
+      signedRequest({
+        body: JSON.stringify({
+          application_id: "APP1",
+          channel_id: "C01",
+          data: { component_type: 2, custom_id: customId },
+          guild_id: "G01",
+          id: `I-${userId}`,
+          member: { user: { id: userId, username: userId } },
+          message: { content, id: "M01" },
+          token: "tok2",
+          type: 3,
+          version: 1,
+        }),
+        privateKey,
+      });
+    const answered = (principalId: string) =>
       expect.objectContaining({
-        auth: null,
+        auth: expect.objectContaining({ principalId }),
         inputResponses: [{ optionId: "approve", requestId: "call_1" }],
-      }),
-    );
+      });
+
+    it("answers as the guild member who pressed", async () => {
+      const channel = discordChannel({ credentials: { publicKey: publicKeyHex } });
+
+      const { response, send } = await firePost(channel, press("U01"));
+
+      await expect(response.json()).resolves.toEqual({ type: 6 });
+      expect(send).toHaveBeenCalledWith("C01:M01", answered("discord:G01:U01"));
+    });
+
+    it("lets onInputResponse accept a press with ctx.defaultAuth or drop it", async () => {
+      const channel = discordChannel({
+        credentials: { publicKey: publicKeyHex },
+        onInputResponse: (ctx, interaction) =>
+          interaction.user.id === "U01" ? { auth: ctx.defaultAuth } : null,
+      });
+
+      const accepted = await firePost(channel, press("U01"));
+      const dropped = await firePost(channel, press("U02"));
+
+      expect(accepted.send).toHaveBeenCalledWith("C01:M01", answered("discord:G01:U01"));
+      expect(dropped.send).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      {
+        name: "onInputResponse throws",
+        config: {
+          onInputResponse: () => {
+            throw new Error("policy lookup failed");
+          },
+        },
+        log: { level: "error", message: "input response handler failed" },
+      },
+      {
+        name: "onCommand is custom and onInputResponse isn't",
+        config: { onCommand: () => ({ auth: null }) },
+        log: { level: "warn", message: expect.stringContaining("set onInputResponse") },
+      },
+    ])("drops a press when $name", async ({ config, log }) => {
+      const logs = captureLogRecords();
+      const channel = discordChannel({ credentials: { publicKey: publicKeyHex }, ...config });
+
+      const { send } = await firePost(channel, press("U01"));
+
+      expect(send).not.toHaveBeenCalled();
+      expect(logs.records).toContainEqual(expect.objectContaining(log));
+    });
+
+    describe("when no session takes the press", () => {
+      const notActive = () => vi.fn().mockRejectedValue(new SessionNotActiveError());
+      const discordApi = (config: Parameters<typeof discordChannel>[0] = {}) => {
+        const fetchMock = vi.fn(async (_url: unknown, _init?: RequestInit) =>
+          Response.json({ channel_id: "C01", id: "M02" }),
+        );
+        return {
+          channel: discordChannel({
+            api: { fetch: fetchMock as typeof fetch },
+            credentials: { applicationId: "APP1", botToken: "bot-token", publicKey: publicKeyHex },
+            ...config,
+          }),
+          calls: () =>
+            fetchMock.mock.calls.map(([url, init]) => ({
+              body: JSON.parse(String(init?.body)) as unknown,
+              method: init?.method,
+              url: String(url),
+            })),
+        };
+      };
+      const prompt = {
+        body: { components: [], content: "Approve?\n\nNo longer active" },
+        method: "PATCH",
+        url: "https://discord.com/api/v10/channels/C01/messages/M01",
+      };
+      const notice = {
+        body: { allowed_mentions: { parse: [] }, content: INACTIVE_REQUEST_NOTICE, flags: 64 },
+        method: "POST",
+        url: "https://discord.com/api/v10/webhooks/APP1/tok2",
+      };
+
+      it("retires the pressed prompt and tells only the presser", async () => {
+        captureLogRecords();
+        const { channel, calls } = discordApi();
+
+        await firePost(channel, press("U01"), notActive());
+
+        expect(calls()).toEqual([prompt, notice]);
+      });
+
+      it("only tells the presser when the press carries no prompt to keep", async () => {
+        captureLogRecords();
+        const { channel, calls } = discordApi();
+
+        await firePost(channel, press("U01", null), notActive());
+
+        expect(calls()).toEqual([notice]);
+      });
+
+      it("leaves the prompt alone when delivery fails for another reason", async () => {
+        captureLogRecords();
+        const { channel, calls } = discordApi();
+
+        await firePost(channel, press("U01"), vi.fn().mockRejectedValue(new Error("boom")));
+
+        expect(calls()).toEqual([]);
+      });
+
+      it("leaves the prompt alone when onInputResponse drops the press", async () => {
+        captureLogRecords();
+        const { channel, calls } = discordApi({ onInputResponse: () => null });
+
+        await firePost(channel, press("U01"), notActive());
+
+        expect(calls()).toEqual([]);
+      });
+    });
   });
 
   it("opens and resolves freeform HITL modals", async () => {
@@ -393,6 +511,7 @@ describe("discordChannel() inbound route", () => {
     expect(submit.send).toHaveBeenCalledWith(
       "C01:M01",
       expect.objectContaining({
+        auth: expect.objectContaining({ principalId: "discord:U01" }),
         inputResponses: [{ requestId: "call_1", text: "freeform answer" }],
       }),
     );
@@ -589,13 +708,10 @@ describe("defaultDiscordAuth", () => {
     const auth = defaultDiscordAuth({
       applicationId: "APP1",
       channelId: "C01",
-      commandName: "ask",
       guildId: "G01",
       id: "I01",
-      options: [],
       raw: {},
       token: "tok",
-      type: 2,
       user: { id: "U01", isBot: false, username: "ada" },
     });
 

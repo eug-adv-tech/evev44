@@ -25,13 +25,16 @@ import modelContextProtocolServer from "./@modelcontextprotocol/server.mjs";
 import opentelemetryApi from "./@opentelemetry/api.mjs";
 import opentelemetryOtlpTransformer from "./@opentelemetry/otlp-transformer.mjs";
 import standardSchemaSpec from "./@standard-schema/spec.mjs";
+import vercelAgentRuns from "./@vercel/agent-runs.mjs";
 import vercelBlob from "./@vercel/blob.mjs";
 import vercelConnect from "./@vercel/connect.mjs";
 import vercelDetectAgent from "./@vercel/detect-agent.mjs";
 import vercelOidc from "./@vercel/oidc.mjs";
 import vercelOtel from "./@vercel/otel.mjs";
+import vercelQueue from "./@vercel/queue.mjs";
 import vercelSandbox from "./@vercel/sandbox.mjs";
 import vercelSdk from "./@vercel/sdk.mjs";
+import vercelSchedules from "./@vercel/schedules.mjs";
 import workflowCore from "./@workflow/core.mjs";
 import workflowErrors from "./@workflow/errors.mjs";
 import workflowSerde from "./@workflow/serde.mjs";
@@ -95,13 +98,16 @@ export const MODULES = [
   shadcnRegistry,
   standardSchemaSpec,
   turndown,
+  vercelAgentRuns,
   vercelBlob,
   vercelConnect,
   vercelDetectAgent,
   vercelOidc,
   vercelOtel,
+  vercelQueue,
   vercelSandbox,
   vercelSdk,
+  vercelSchedules,
   workflowCore,
   workflowErrors,
   workflowSerde,

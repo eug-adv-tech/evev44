@@ -133,8 +133,9 @@ describe("parsePromptCommand", () => {
     });
   });
 
-  it("recognizes /reset, /cancel, /clear, /compact, /exit, and /quit", () => {
-    expect(parsePromptCommand("/reset")).toEqual({ type: "reset" });
+  it("recognizes /new, /reset, /cancel, /clear, /compact, /exit, and /quit", () => {
+    expect(parsePromptCommand("/new")).toEqual({ type: "new" });
+    expect(parsePromptCommand("/reset")).toEqual({ type: "new" });
     expect(parsePromptCommand("/cancel")).toEqual({ type: "cancel" });
     expect(parsePromptCommand("/clear")).toEqual({ type: "clear" });
     expect(parsePromptCommand("/compact")).toEqual({ type: "compact" });
@@ -386,8 +387,9 @@ describe("EveTUIRunner initial input", () => {
 
 describe("parsePromptCommand", () => {
   it.each([
-    ["/reset", { type: "reset" }],
-    ["/new", { type: "clear" }],
+    ["/new", { type: "new" }],
+    ["/reset", { type: "new" }],
+    ["/clear", { type: "clear" }],
     ["/exit", { type: "exit" }],
     ["/quit", { type: "exit" }],
     ["/deploy", { type: "extension", name: "deploy", argument: "" }],
@@ -1428,10 +1430,51 @@ describe("EveTUIRunner session commands", () => {
       renderer: turnTaking(["Hello.", "/compact", "/clear", undefined], { finishCommand }).renderer,
     }).run();
 
-    expect(outcomes).toEqual(["Compaction requested", "dismissed"]);
+    expect(outcomes).toEqual(["Compaction requested", "Session context cleared"]);
     expect(server.requestsTo("POST", "/session_1/compact")).toHaveLength(1);
     expect(server.requestsTo("POST", "/session_1/clear")).toHaveLength(1);
     expect(server.requestsTo("POST", "/session_1")).toHaveLength(0);
+  });
+
+  it("names a stranded session, refuses to clear it, and starts fresh after /new", async () => {
+    const server = new FakeEveServer();
+    const stranded = {
+      code: "session_stranded",
+      error: "This session is stranded.",
+      eveVersion: "0.0.1",
+      ok: false,
+    };
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (
+        init?.method === "POST" &&
+        (path === "/eve/v1/session/session_1" || path === "/eve/v1/session/session_1/clear")
+      ) {
+        await server.fetch(input, init);
+        return Response.json(stranded, { status: 409 });
+      }
+      return await server.fetch(input, init);
+    });
+    const outcomes: unknown[] = [];
+    const renderError = vi.fn();
+    await new EveTUIRunner({
+      client: stubClient(),
+      renderer: turnTaking(
+        ["Hello.", "Still there?", "/clear", "/new", "Fresh start.", undefined],
+        { finishCommand: (outcome) => outcomes.push(outcome), renderError },
+      ).renderer,
+    }).run();
+
+    const notice =
+      "Session session_1 is stranded (built by eve 0.0.1): the deployment that ran it is no longer available. The session cannot continue. Run /new to end it and start a fresh session.";
+    expect(renderError).toHaveBeenCalledWith("Session stranded", notice);
+    expect(outcomes).toEqual([
+      { kind: "result", message: notice, summary: "Couldn't clear the session" },
+      { kind: "dismiss" },
+    ]);
+    expect(server.requestsTo("POST", "/session_1/clear")).toHaveLength(1);
+    expect(server.requestsTo("POST", "/session_1/reset")).toHaveLength(1);
+    expect(server.sessionId).toBe("session_2");
   });
 
   it("keeps the conversation when /reset cannot retire the session", async () => {

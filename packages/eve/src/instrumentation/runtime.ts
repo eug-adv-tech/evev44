@@ -12,7 +12,8 @@ import type {
   InstrumentationTraceSeed,
   InstrumentationTurnStartedEvent,
 } from "#instrumentation/lifecycle.js";
-import { attemptIdempotencyKey } from "#instrumentation/lifecycle.js";
+import { attemptIdempotencyKey, toolCallIdempotencyKey } from "#instrumentation/lifecycle.js";
+import { findInstrumentationActionScopeForCall } from "#instrumentation/state.js";
 import {
   buildTelemetryRuntimeContext,
   snapshotInstrumentationRuntimeContext,
@@ -28,7 +29,7 @@ import {
   publishInputResolutions,
   type CreateInstrumentationHandleEventInput,
 } from "#instrumentation/native-events.js";
-import type { ResolvedInputBatch } from "#harness/input-requests.js";
+import type { ResolvedInputBatch } from "#harness/input-request-resolution.js";
 import type { HandleEventFn } from "#harness/types.js";
 import {
   instrumentChannelDelivery,
@@ -41,8 +42,8 @@ import {
   type PrepareTurnTraceContextInput,
 } from "#instrumentation/prepare-trace-context.js";
 import type { RuntimeTraceContext } from "#protocol/message.js";
-import type { OtelHarnessSettings, RuntimeContextResolver } from "#tracing/otel-declaration.js";
-import { AgentSpanIdGenerator } from "#tracing/agent-span-id-generator.js";
+import type { OtelHarnessSettings, RuntimeContextResolver } from "#tracing/eve/otel-declaration.js";
+import { AgentSpanIdGenerator } from "#compiled/@vercel/agent-runs/index.js";
 import { contextStorage, type ContextContainer } from "#context/container.js";
 import {
   createMemoryInstrumentation,
@@ -50,15 +51,15 @@ import {
 } from "#instrumentation/memory.js";
 import { ConversationIdKey, ParentSessionKey } from "#context/keys.js";
 import type { ConversationContext } from "#shared/conversation-context.js";
-import { withErrorContent } from "#tracing/error-content-context.js";
-import type { AgentSamplingOperation } from "#tracing/agent-span-contract.js";
+import { withCapture } from "#compiled/@vercel/agent-runs/otel.js";
+import type { SamplingOperation as AgentSamplingOperation } from "#tracing/eve/otel-registration.js";
 import {
   isSampledTrace,
   resolveTracePolicy,
   resolveTracePolicyDecision,
-} from "#tracing/sampled-trace.js";
+} from "#shared/trace-policy.js";
 import { readInstrumentationSessionContext } from "#instrumentation/session-context.js";
-import { readSessionTraceDecision } from "#tracing/agent-trace-context-store.js";
+import { readSessionTraceDecision } from "#tracing/eve/agent-trace-context-store.js";
 import { readInstrumentationDecision } from "#shared/instrumentation-decision.js";
 import { applyLiveDeliveryAudienceCeiling } from "#shared/forwarded-trace-policy.js";
 import { readConversationId } from "#shared/conversation-identity.js";
@@ -69,11 +70,13 @@ import {
 } from "#instrumentation/runtime-global.js";
 import { initializeSessionInstrumentation } from "#instrumentation/session-init.js";
 import { ensureAiSdkWarningLogger } from "#instrumentation/ai-sdk-warnings.js";
+import { createGatewayTraceContextHeaders } from "#tracing/eve/gateway.js";
 
 export { getInstrumentationRuntime, registerInstrumentationRuntime };
 export { initializeSessionInstrumentation };
 const TURN_TRACE_STATE_KEY = "eve.harness.turnTrace";
 import type { SessionTraceSeed } from "#context/keys.js";
+import type { TASK_CANCEL_TOOL_NAME, TASK_WAIT_TOOL_NAME } from "#protocol/task-tools.js";
 
 interface InstrumentedStepSession {
   readonly sessionId: string;
@@ -81,6 +84,7 @@ interface InstrumentedStepSession {
 }
 
 export interface InstrumentationStepScope<TSession> {
+  readonly gatewayTraceContextHeaders?: () => Record<string, string> | undefined;
   readonly createHandleEvent: (
     input: Omit<
       CreateInstrumentationHandleEventInput,
@@ -96,6 +100,7 @@ export interface InstrumentationStepScope<TSession> {
     >,
   ) => HandleEventFn | undefined;
   readonly prepareAttempt: (input: {
+    readonly isFrameworkTool?: (name: string) => boolean;
     readonly attemptIndex: number;
     readonly runtimeContext?: Readonly<Record<string, unknown>>;
     readonly stepIndex: number;
@@ -173,6 +178,15 @@ export interface SessionInstrumentation {
 }
 
 export interface ExecutionInstrumentation {
+  readonly instrumentTaskToolCall: (input: {
+    readonly callId: string;
+    readonly toolName: typeof TASK_WAIT_TOOL_NAME | typeof TASK_CANCEL_TOOL_NAME;
+    readonly startedAtMs: number;
+    readonly completedAtMs: number;
+    readonly input: unknown;
+    readonly output?: unknown;
+    readonly failed?: boolean;
+  }) => Promise<void>;
   readonly createHandleEvent: (input: {
     readonly handleEvent?: HandleEventFn;
     readonly turnId?: string;
@@ -403,6 +417,7 @@ export function bindInstrumentationRuntime(
         };
         const run = () =>
           execute({
+            gatewayTraceContextHeaders: createGatewayTraceContextHeaders,
             createHandleEvent: (eventInput) =>
               createInstrumentationHandleEvent({
                 ...eventInput,
@@ -435,6 +450,7 @@ export function bindInstrumentationRuntime(
                 hooks,
                 runtime.runInContext,
                 attemptInput.runtimeContext,
+                attemptInput.isFrameworkTool,
               );
               return {
                 complete: () =>
@@ -485,7 +501,11 @@ export function bindInstrumentationRuntime(
           });
         try {
           return await otelContext.with(
-            withErrorContent(parentContext ?? otelContext.active(), content.recordOutputs),
+            withCapture(parentContext ?? otelContext.active(), {
+              emit: true,
+              recordInputs: content.recordInputs,
+              recordOutputs: content.recordOutputs,
+            }),
             run,
           );
         } finally {
@@ -496,6 +516,31 @@ export function bindInstrumentationRuntime(
     };
   };
   return {
+    async instrumentTaskToolCall(input) {
+      const correlation = findInstrumentationActionScopeForCall(
+        boundSession.sessionId,
+        input.callId,
+      );
+      if (correlation === undefined) return;
+      const hooks = bindHooks(readSessionContext());
+      const scope = correlation.scope;
+      const idempotencyKey = toolCallIdempotencyKey(scope, input.callId, 0);
+      await runtime.runInContext(
+        {
+          type: "tool.call",
+          callId: input.callId,
+          idempotencyKey,
+          scope,
+          toolName: input.toolName,
+          startedAtMs: input.startedAtMs,
+          frameworkTool: true,
+          input: (hooks.capturesInputs ?? hooks.capturesContent) ? input.input : undefined,
+          completedAtMs: input.completedAtMs,
+          failed: input.failed,
+        },
+        () => Promise.resolve(),
+      );
+    },
     createHandleEvent: (input) => {
       const sessionContext = readSessionContext();
       return createInstrumentationHandleEvent({
